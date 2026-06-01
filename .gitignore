@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# 大文件：训练数据集 / 训练输出 / 可下载的预训练权重（不进 git，太大）
+/data/yolo_dataset/
+/data/runs/
+/yolov8n.pt
+/yolov8s-worldv2.pt
+
+# 临时/系统
+*.log
+.DS_Store
+Thumbs.db
