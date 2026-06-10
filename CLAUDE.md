@@ -121,4 +121,8 @@ python scripts/extract_features.py
 
 # 打包 EXE
 python scripts/build_exe.py
+
+
+
+
 ```
