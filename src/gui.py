@@ -1,8 +1,12 @@
 """Tkinter GUI：实时扫描模式（检测后端自动选择：有 data/yolo/best.pt 用 YOLO，否则 SIFT；3 秒滑动窗口防抖）
 
 工作流：
-  - 摄像头模式（双线程实时）：采集线程持续读帧并实时显示；检测线程在后台连续跑
-    YOLO/SIFT，只回写"最近识别时间戳 + 框"。推理慢只拖慢检测刷新率，视频始终流畅。
+  - 摄像头模式（双线程实时）：显示线程持续读帧 + 叠最近的框 + 显示，永远满帧率；
+    推理线程在后台跑 YOLO，只回写"最近的框 + 识别时间戳"。两线程不互相阻塞，
+    所以模型再重也只拖慢"框刷新率"，视频本身始终流畅。
+    避开旧双线程"饿死显示"的两个关键：① torch 限核（留 CPU 给显示线程，见
+    yolo_detector）；② 显示线程每帧只做 cv2 画框 + 缓存标签贴图（render_live），
+    绝不每帧整幅 PIL 渲染。
   - 静态图模式：弹文件框选图 → 检测一次 → 立即刷新列表
   - 右侧列表全量显示全部工具，识别中的（✓ 绿）排上面，未识别的（✗ 红）排下面
   - 列表 UI 每 3 秒刷新一次（不实时刷新，避免闪烁）；可见性窗口 3 秒
@@ -89,6 +93,8 @@ class ToolDetectionApp:
         # 运行状态
         self.cap = None
         self.use_camera = False
+        self.is_video_file = False   # True=播放视频文件（需按原生帧率播放、放完自动停）
+        self.video_fps = 0.0
         self.static_frame = None
         self.running = False
         self.should_speak = False
@@ -97,11 +103,23 @@ class ToolDetectionApp:
         self.last_source = {}    # 工具名 -> 上一帧命中来源（"强"/"弱"/"色"）
         self.detect_threshold = 10   # 上一帧有效阈值（自适应，诊断显示用）
 
-        # 单线程实时循环：一个检测线程里"读帧→限频推理→叠框→显示→刷列表"一条龙跑完。
-        # 不再拆采集/推理双线程——纯 CPU 较弱机器上双线程会让推理吃满核、把显示线程饿死，
-        # 导致开头几秒不出检测、视频卡顿、框叠不上。单线程没有线程互抢，开局第一帧就出结果。
-        self._last_boxes = []            # 最近一次 YOLO 推理的框，每帧叠加到实时画面 → 框常驻不闪
+        # 双线程实时：显示线程(读帧+叠框+显示) 与 推理线程(后台跑 YOLO) 解耦。
+        # 重模型(如 yolo11s)单帧推理几十~几百 ms，若和显示同线程会每隔 DETECT_INTERVAL
+        # 就把画面冻住几百 ms → 卡顿。拆开后推理只在后台更新"最近的框"，显示线程不等推理，
+        # 视频始终满帧率；模型重只表现为框刷新率低一点（固定监控场景工具不动，无感）。
+        self._last_boxes = []            # 显示线程每帧叠到实时画面的框（经"存活期"平滑，防闪）
+        self._box_store = {}             # 工具名 -> (框, 时间戳)：框防闪用，见 _hold_boxes
         self._last_annotated = None      # 最近一次 SIFT 标注帧（SIFT 回退用）
+        self._latest_frame = None        # 读帧线程读到的最新原始帧，供推理线程取用（共享）
+        self._display_frame = None       # 叠好框的"待显示帧"，由主线程 _ui_pump 取去画（共享）
+        self._display_id = 0             # 待显示帧的版本号，主线程据此判断是否有新帧
+        self._frame_lock = threading.Lock()
+        self._infer_running = False      # 推理线程开关
+        # 主线程 UI 泵的状态
+        self._last_shown_id = -1
+        self._last_recog = None
+        self._last_ui_refresh = 0.0
+        self._last_speak = 0.0
 
         diag("=" * 50)
         diag(f"启动诊断：后端={'YOLO' if self.use_yolo else 'SIFT(回退)'}, "
@@ -148,6 +166,13 @@ class ToolDetectionApp:
                                   relief="flat", cursor="hand2",
                                   command=self.stop_detection, state="disabled")
         self.stop_btn.pack(side="left", padx=15)
+
+        self.video_btn = tk.Button(button_frame, text="🎬 打开视频",
+                                   font=("Microsoft YaHei UI", 16, "bold"),
+                                   bg="#1f6feb", fg="white", width=14, height=2,
+                                   relief="flat", cursor="hand2",
+                                   command=self.open_video)
+        self.video_btn.pack(side="left", padx=15)
 
         self.reset_btn = tk.Button(button_frame, text="🔄 清空显示",
                                    font=("Microsoft YaHei UI", 16, "bold"),
@@ -399,6 +424,7 @@ class ToolDetectionApp:
             return
 
         self.use_camera = False
+        self.is_video_file = False
         self.static_frame = None
 
         if self.cap is None:
@@ -430,6 +456,8 @@ class ToolDetectionApp:
         # 清掉上一轮残留的框，避免新一轮开头闪到旧画面
         self._last_boxes = []
         self._last_annotated = None
+        with self._frame_lock:
+            self._latest_frame = None
 
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
@@ -440,10 +468,70 @@ class ToolDetectionApp:
 
         self.detection_thread = threading.Thread(target=self.detection_loop, daemon=True)
         self.detection_thread.start()
+        if self.use_camera:          # 摄像头实时模式才需要主线程 UI 泵；静态图一次性显示不用
+            self._start_ui_pump()
+
+    def open_video(self):
+        """选一个视频文件，按原生帧率播放并实时检测（复用摄像头双线程逻辑）。
+
+        与摄像头的区别：① 视频读帧不会自带节奏，要按视频 fps 主动限速，否则一闪而过；
+        ② 放到结尾要自动停。这两点在 _camera_loop 里按 is_video_file 处理。
+        """
+        if self.running:
+            self.stop_detection()
+        if self.detector_engine is None:
+            messagebox.showwarning(
+                "检测器未就绪",
+                f"检测器未就绪，无法开始检测。\n\n详细错误：\n{self.model_error or '未知'}")
+            return
+        if not self._valid_tools():
+            messagebox.showwarning("警告", "没有任何可用工具，无法检测。")
+            return
+
+        initial_dir = str(DATA_DIR / "video")
+        if not os.path.isdir(initial_dir):
+            initial_dir = str(DATA_DIR)
+        file_path = filedialog.askopenfilename(
+            title="选择要检测的视频",
+            initialdir=initial_dir,
+            filetypes=[("视频文件", "*.mp4 *.avi *.mov *.mkv *.flv *.wmv"),
+                       ("所有文件", "*.*")],
+        )
+        if not file_path:
+            return
+
+        cap = cv2.VideoCapture(file_path)
+        if not cap.isOpened():
+            messagebox.showerror("错误", f"无法打开视频：\n{file_path}")
+            return
+
+        self.cap = cap
+        self.use_camera = True       # 走实时双线程循环（读帧+后台推理）
+        self.is_video_file = True
+        self.static_frame = None
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        self.video_fps = fps if fps and fps > 1 else 25.0
+
+        self.running = True
+        self.should_speak = True
+        self._last_boxes = []
+        self._last_annotated = None
+        with self._frame_lock:
+            self._latest_frame = None
+
+        self.start_btn.config(state="disabled")
+        self.stop_btn.config(state="normal")
+        self.stats_label.config(
+            text=f"正在检测视频（{os.path.basename(file_path)}）...", fg="#00ff88")
+
+        self.detection_thread = threading.Thread(target=self.detection_loop, daemon=True)
+        self.detection_thread.start()
+        self._start_ui_pump()
 
     def stop_detection(self):
         self.running = False
         self.should_speak = False
+        self._infer_running = False   # 停掉后台推理线程
 
         if self.cap is not None:
             self.cap.release()
@@ -495,87 +583,211 @@ class ToolDetectionApp:
             print(f"检测出错: {e}")
             self.stop_detection()
 
-    def _camera_loop(self):
-        """单线程实时循环：读帧 → 限频推理 → 每帧叠最近的框 → 显示 → 刷列表，一条龙跑完。
+    def _start_ui_pump(self):
+        """复位 UI 泵状态并在主线程启动它（由主线程的按钮回调调用）。"""
+        self._last_shown_id = -1
+        self._last_recog = None
+        self._last_ui_refresh = 0.0
+        self._last_speak = time.time()   # 首次播报推迟 SPEAK_INTERVAL，别一打开就念一堆
+        with self._frame_lock:
+            self._display_frame = None
+            self._display_id = 0
+        self.root.after(0, self._ui_pump)
 
-        为什么单线程：纯 CPU 较弱机器上，"采集/推理双线程"会让 torch 推理吃满核、把显示线程
-        饿死——表现就是开头几秒不出检测、视频卡顿、框叠不上、语音误报全部缺失。单线程没有线程
-        互抢，开局第一帧就出结果；DETECT_INTERVAL 限频让出大部分时间给读帧+显示，视频依旧顺。
-        框常驻：每帧都把最近一次推理的框叠到当前实时画面上（不是只在推理那一帧画），所以不闪。
+    def _camera_loop(self):
+        """读帧线程：持续读帧 → 叠最近的框（纯 cv2，不碰 Tkinter）→ 存成待显示帧。
+
+        三方分工：本线程只读帧+叠框（不碰 Tkinter）；_inference_worker 后台跑推理回写框；
+        主线程 _ui_pump 取待显示帧画图+刷列表。Tkinter 全在主线程，避免黑屏闪烁。
+        框常驻：每帧把推理线程最新回写的 _last_boxes 叠上（render_live 缓存贴图，几乎零开销），
+        所以框跟着实时画面、不闪。
         """
-        last_speak = 0.0
-        last_detect = 0.0
-        last_ui_refresh = 0.0
-        # 诊断计数
+        self._box_store = {}  # 清掉上一轮的框存活记录
+        # 启动后台推理线程
+        self._infer_running = True
+        worker = threading.Thread(target=self._inference_worker, daemon=True)
+        worker.start()
+
+        # 视频文件：按原生帧率播放（否则读多快放多快，一闪而过）
+        frame_interval = (1.0 / self.video_fps) if self.is_video_file else 0.0
+        next_frame_t = time.time()
+
+        # 诊断计数（读帧帧率）
         diag_t0 = time.time()
         diag_frames = 0
-        diag_infer_ms = 0.0
-        diag_infers = 0
         while self.running and self.cap is not None:
             ret, frame = self.cap.read()
             if not ret:
-                time.sleep(0.05)
+                if self.is_video_file:
+                    break          # 视频放完 → 退出循环，自动停止
+                time.sleep(0.05)   # 摄像头偶发读帧失败 → 重试
                 continue
 
             now = time.time()
             diag_frames += 1
 
-            # 限频推理：到点才跑一次，更新"最近的框 + last_seen + 置信度"
-            if now - last_detect >= DETECT_INTERVAL:
-                last_detect = now
-                t_infer = time.time()
-                try:
-                    if self.use_yolo:
-                        detected, counts, boxes = self.detector_engine.infer(frame)
-                        self._last_boxes = boxes
-                    else:
-                        detected, annotated, counts = self.detector_engine.detect(frame)
-                        self._last_annotated = annotated
-                except Exception as e:
-                    diag(f"检测出错: {e}")
-                    detected, counts = set(), {}
-                diag_infer_ms += (time.time() - t_infer) * 1000
-                diag_infers += 1
+            # 把最新帧交给推理线程（只存引用，worker 取用时自己 copy）
+            with self._frame_lock:
+                self._latest_frame = frame
 
-                for name in detected:
-                    self.last_seen[name] = now
-                self.last_counts.update(counts)
-                self.last_source = dict(getattr(self.detector_engine, "last_source", {}))
-                self.detect_threshold = getattr(self.detector_engine, "last_threshold", 0)
-                hits = " ".join(
-                    f"{n}={counts.get(n, 0)}{self.last_source.get(n, '')}"
-                    for n in sorted(detected))
-                print(f"[检测 {len(detected)}个] {hits or '(空)'}")
-
-            # 每帧都把"最近一次检测的框"叠到当前实时帧上 → 框常驻、跟着实时画面、不闪
+            # 叠框（纯 cv2/numpy，不碰 Tkinter）。每帧把推理线程最新回写的框叠上 → 框常驻不闪
             if self.use_yolo:
-                display = (self.detector_engine.render(frame, self._last_boxes)
+                display = (self.detector_engine.render_live(frame.copy(), self._last_boxes)
                            if self._last_boxes else frame)
             else:
                 display = self._last_annotated if self._last_annotated is not None else frame
-            self._show_frame(display)
 
-            # 列表 UI 每 3 秒刷新一次（不实时刷新，避免行频繁 pack/forget 抖动）
-            if now - last_ui_refresh >= UI_REFRESH_INTERVAL:
-                self.refresh_visible_list()
-                last_ui_refresh = now
+            # 存成"待显示帧"，交给主线程 _ui_pump 去画。绝不在这个后台线程里调 Tkinter——
+            # 后台线程直接建 PhotoImage/configure 会和主线程重绘抢，导致画面间歇性闪黑。
+            with self._frame_lock:
+                self._display_frame = display
+                self._display_id += 1
 
-            if self.should_speak and now - last_speak >= SPEAK_INTERVAL:
-                self.speak_missing()
-                last_speak = now
-
-            # 每 2 秒报一次：显示帧率 + 平均推理耗时（写进 run_diag.txt 便于远程诊断）
+            # 每 2 秒报一次读帧帧率（写进 run_diag.txt 便于远程诊断）
             if now - diag_t0 >= 2.0:
                 fps = diag_frames / (now - diag_t0)
-                avg_infer = diag_infer_ms / max(diag_infers, 1)
-                diag(f"单线程：显示 {fps:.1f} fps，推理 {avg_infer:.0f} ms × {diag_infers} 次/2s，"
-                     f"窗口内命中 {len([n for n, t in self.last_seen.items() if now - t < VISIBILITY_WINDOW])} 个")
+                hit = len([n for n, t in list(self.last_seen.items())
+                           if now - t < VISIBILITY_WINDOW])
+                diag(f"读帧线程：{fps:.1f} fps，窗口内命中 {hit} 个")
                 diag_t0 = now
                 diag_frames = 0
+
+            # 限速：视频文件按原生帧率播放；摄像头只让出极短时间
+            if self.is_video_file:
+                next_frame_t += frame_interval
+                delay = next_frame_t - time.time()
+                if delay > 0:
+                    time.sleep(delay)
+                else:
+                    next_frame_t = time.time()   # 落后了就别越积越多
+            else:
+                time.sleep(0.01)
+
+        # 读帧线程退出 → 通知推理线程收尾
+        self._infer_running = False
+
+        # 视频自然放完（非手动停止）→ 回主线程复位按钮与状态
+        if self.is_video_file and self.running:
+            self.root.after(0, self._on_video_finished)
+
+    def _ui_pump(self):
+        """主线程 UI 泵：定时取最新"待显示帧"来画 + 刷列表 + 触发语音。
+
+        所有 Tkinter 操作都在这里（主线程）完成，跟 mainloop 重绘同步，
+        避免后台线程直接画图导致的黑屏闪烁。running=False 时自动停止重调度。
+        """
+        if not self.running:
+            return
+        now = time.time()
+
+        # 只在有新帧时才画（避免重复建 PhotoImage）
+        with self._frame_lock:
+            frame = self._display_frame
+            did = self._display_id
+        if frame is not None and did != self._last_shown_id:
+            self._show_frame(frame)
+            self._last_shown_id = did
+
+        # 列表刷新：识别集合变化就刷（节流 1s），否则每 UI_REFRESH_INTERVAL 兜底
+        recog_now = frozenset(n for n, t in list(self.last_seen.items())
+                              if now - t < VISIBILITY_WINDOW)
+        if ((recog_now != self._last_recog and now - self._last_ui_refresh >= 1.0)
+                or now - self._last_ui_refresh >= UI_REFRESH_INTERVAL):
+            self.refresh_visible_list()
+            self._last_ui_refresh = now
+            self._last_recog = recog_now
+
+        # 语音播报（report 非阻塞，瞬间返回）
+        if self.should_speak and now - self._last_speak >= SPEAK_INTERVAL:
+            self.speak_missing()
+            self._last_speak = now
+
+        self.root.after(15, self._ui_pump)   # ~每 15ms 一次，跟随主循环重绘
+
+    def _on_video_finished(self):
+        """视频播放结束后在主线程里复位 UI（手动停止不走这里）。"""
+        self.running = False
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+        self.start_btn.config(state="normal", text="▶ 立即检测")
+        self.stop_btn.config(state="disabled")
+        self.refresh_visible_list()
+        self.stats_label.config(text="视频检测完毕", fg="#00ff88")
+
+    def _hold_boxes(self, boxes):
+        """框防闪：每个工具的框按名字保留 VISIBILITY_WINDOW 秒。
+
+        阈值边缘的工具会一会儿检到、一会儿漏掉，若每次推理直接用当次结果，框就一闪一闪。
+        这里把"最近一次检到的框"按工具名存活一段时间：偶尔漏检不立刻抹掉、沿用上次位置，
+        直到真的超过存活期才消失。返回当前应显示的框列表（每个工具一个，取最新位置）。
+        只有推理线程调用，self._box_store 不跨线程写，赋值给 _last_boxes 是原子操作。
+        """
+        now = time.time()
+        for b in boxes:
+            self._box_store[b[4]] = (b, now)   # b[4] 是工具中文名
+        held = []
+        for name in list(self._box_store.keys()):
+            b, ts = self._box_store[name]
+            if now - ts < VISIBILITY_WINDOW:
+                held.append(b)
+            else:
+                del self._box_store[name]       # 过期 → 框消失
+        return held
+
+    def _inference_worker(self):
+        """后台推理线程：每 DETECT_INTERVAL 取一次最新帧跑 YOLO/SIFT，
+        只回写 _last_boxes / last_seen / last_counts，不碰 Tkinter（线程安全）。
+
+        与显示线程解耦：推理慢只拖慢"框刷新率"，绝不阻塞显示线程读帧/显示。
+        """
+        last_detect = 0.0
+        diag_t0 = time.time()
+        diag_infer_ms = 0.0
+        diag_infers = 0
+        while self._infer_running and self.running:
+            now = time.time()
+            if now - last_detect < DETECT_INTERVAL:
+                time.sleep(0.01)
+                continue
+            with self._frame_lock:
+                frame = None if self._latest_frame is None else self._latest_frame.copy()
+            if frame is None:
+                time.sleep(0.01)
+                continue
+            last_detect = now
+
+            t_infer = time.time()
+            try:
+                if self.use_yolo:
+                    detected, counts, boxes = self.detector_engine.infer(frame)
+                    self._last_boxes = self._hold_boxes(boxes)
+                else:
+                    detected, annotated, counts = self.detector_engine.detect(frame)
+                    self._last_annotated = annotated
+            except Exception as e:
+                diag(f"检测出错: {e}")
+                detected, counts = set(), {}
+            diag_infer_ms += (time.time() - t_infer) * 1000
+            diag_infers += 1
+
+            stamp = time.time()
+            for name in detected:
+                self.last_seen[name] = stamp
+            self.last_counts.update(counts)
+            self.last_source = dict(getattr(self.detector_engine, "last_source", {}))
+            self.detect_threshold = getattr(self.detector_engine, "last_threshold", 0)
+            hits = " ".join(
+                f"{n}={counts.get(n, 0)}{self.last_source.get(n, '')}"
+                for n in sorted(detected))
+            print(f"[检测 {len(detected)}个] {hits or '(空)'}")
+
+            if stamp - diag_t0 >= 2.0:
+                avg = diag_infer_ms / max(diag_infers, 1)
+                diag(f"推理线程：{avg:.0f} ms/帧 × {diag_infers} 次/2s")
+                diag_t0 = stamp
                 diag_infer_ms = 0.0
                 diag_infers = 0
-
-            time.sleep(0.01)
 
     def _static_once(self):
         now = time.time()

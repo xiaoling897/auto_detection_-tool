@@ -1,3 +1,5 @@
+# 注意：.gitignore 不支持行内注释，# 只能在行首。规则后面别跟 # 注释，否则规则失效。
+
 # Python
 __pycache__/
 *.py[cod]
@@ -6,11 +8,25 @@ __pycache__/
 venv/
 build/
 dist/
+# PyInstaller 每次构建自动生成，非源文件
+*.spec
 
-# 大文件：训练数据集 / 标注中间产物 / 训练输出（全在 data/training/ 下，不进 git，太大）
+# 训练数据集 / 标注中间产物 / 训练输出（太大，不进 git）
 /data/training/
+# 自动标注+切分后的训练集（约 2.7GB）
+/data/yolo_dataset/
+# YOLO predict/train 运行输出（约百 MB）
+/data/runs/
+# 采集/测试用的视频录像（约百 MB）
+/data/video/
+# 运行时诊断日志（每次运行追加）
+/data/run_diag.txt
+
 # 可下载的预训练底座权重（放 models/，不进 git，太大）
 /models/
+# 根目录的底座权重（yolov8n.pt / yolov8s-worldv2.pt 等，可重新下载）。
+# 部署模型在 data/yolo/best.pt，不在根目录，照常进 git，不受此规则影响。
+/*.pt
 
 # 临时/系统
 *.log
