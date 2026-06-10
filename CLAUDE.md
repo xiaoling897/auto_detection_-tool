@@ -123,10 +123,19 @@ python tests/test_image_detect.py data/samples/all_tools.jpg
 # 重建 smart_tools.json（加新模板后）
 python scripts/extract_features.py
 
+<<<<<<< HEAD
 # 打包 EXE（onedir 文件夹分发，自动把 data/yolo/best.pt 复制进产物）
 python scripts/build_exe.py             # 正式版：--windowed 无黑窗
 python scripts/build_exe.py --console   # 调试版：保留黑窗，能看 diag() 实时诊断 + run_diag.txt
 # 产物：dist/智能工具检测系统/  —— 整个文件夹拷给别人即可双击运行（含 _internal/ 依赖 + data/）
 # 注：构建会在根目录生成 智能工具检测系统.spec（PyInstaller 自动产物，已 gitignore，可随时删）
 # Windows GBK 控制台跑构建/训练脚本前先设 PYTHONIOENCODING=utf-8，否则 emoji print 会 UnicodeEncodeError
+=======
+# 打包 EXE
+python scripts/build_exe.py
+
+
+
+
+>>>>>>> 44ab011408d0834e3e210402c1a0d5899e00fb2d
 ```
