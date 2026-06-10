@@ -32,6 +32,10 @@ def find_labelimg():
 
 def main():
     LBL_DIR.mkdir(parents=True, exist_ok=True)
+    # labelImg 的 YOLO 模式会在“保存目录”里读写 classes.txt，没有就崩。
+    # 这里把项目的 classes.txt 同步一份到 labels/，避免启动报 FileNotFoundError。
+    if CLASSES.is_file():
+        shutil.copy(CLASSES, LBL_DIR / "classes.txt")
     if not IMG_DIR.is_dir() or not any(IMG_DIR.glob("*.jpg")):
         print(f"⚠️  图片目录为空或不存在：{IMG_DIR}")
         print("    先把要标注的照片(.jpg)放进去再运行本脚本。")
