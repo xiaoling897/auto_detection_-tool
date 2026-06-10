@@ -1,0 +1,11 @@
+﻿智能工具检测系统 — 在新电脑上运行说明
+==========================================
+环境：Windows + Python 3.10/3.11（语音用 SAPI、摄像头用 DSHOW，需 Windows）
+
+1) 安装依赖（首次会下载 PyTorch+ultralytics 约 1-2GB，耐心等）：
+       pip install -r requirements.txt
+2) 运行：
+       python run.py
+3) 点“立即检测”：有摄像头→实时检测（首开卡 7-9 秒正常）；无摄像头→选图片检测。
+
+注意：data/yolo/best.pt 是训练好的模型，必须在，否则无法识别。

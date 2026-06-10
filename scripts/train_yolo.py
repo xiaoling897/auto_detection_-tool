@@ -12,28 +12,38 @@ from ultralytics import YOLO
 # ============ 路径 ============
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
-DATA_YAML = PROJECT_ROOT / "data" / "yolo_dataset" / "data.yaml"
+DATA_YAML = PROJECT_ROOT / "data" / "training" / "yolo_dataset" / "data.yaml"
 OUTPUT_BEST = PROJECT_ROOT / "data" / "yolo" / "best.pt"
 
 # ============ 训练参数 ============
 # CPU 训练优化：小图、小 batch、少 epoch
-# GPU 用户可以提到 epochs=100, imgsz=640, batch=16
+# GPU 用户可以提到 epochs=100, imgsz=640, batch=16, device=0
 TRAIN_CONFIG = dict(
     data=str(DATA_YAML),
-    model="yolov8n.pt",     # nano，最小最快，6MB
-    epochs=50,              # 50 个 epoch 对 700 张图够用
-    imgsz=416,              # 比默认 640 小，CPU 友好
+    model=str(PROJECT_ROOT / "models" / "yolo11s.pt"),  # YOLO11 small：比 v8n 准不少，固定监控场景值得（约 19MB）
+    epochs=80,              # small 模型 + ~700 图，80 epoch 配合早停
+    imgsz=416,              # 无 GPU：416 提速（有 GPU 可提到 640 利于小目标）
     batch=8,                # CPU 友好的 batch
     workers=2,              # CPU 多线程数据加载
-    device="cpu",
-    project=str(PROJECT_ROOT / "data" / "runs"),  # 训练日志/权重保存位置
+    device="cpu",           # 纯 CPU 训练（无 NVIDIA 显卡）
+    project=str(PROJECT_ROOT / "data" / "training" / "runs"),  # 训练日志/权重保存位置
     name="tool_yolo",       # 子目录名
     exist_ok=True,          # 覆盖已有目录
-    patience=15,            # 验证集 15 个 epoch 没提升就早停
+    patience=20,            # 增强变强、收敛变慢，早停耐心加大
     save=True,
     save_period=10,         # 每 10 epoch 存一次 checkpoint
     plots=True,
     verbose=True,
+    # ===== 数据增强（温和：小数据集上暴力增强会欠拟合，泛化靠真实多样数据）=====
+    hsv_h=0.015,            # 色相抖动（默认）
+    hsv_s=0.7,              # 饱和度抖动（默认）
+    hsv_v=0.5,              # 明度抖动（略升，应对不同光照）
+    degrees=5.0,            # 轻微旋转
+    translate=0.1,          # 平移（默认）
+    scale=0.5,              # 缩放（默认）
+    fliplr=0.5,             # 左右翻转（默认）
+    mosaic=1.0,             # 马赛克拼图（合成多物体场景，有用，保留）
+    # perspective/shear/mixup/copy_paste/flipud 关掉——实测暴力增强反而掉点
 )
 
 

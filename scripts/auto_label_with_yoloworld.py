@@ -27,7 +27,7 @@ from ultralytics import YOLOWorld
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 SOURCE_DIR = Path(r"C:\Users\acad1\Desktop\tool_dataset")
-OUTPUT_DIR = PROJECT_ROOT / "data" / "yolo_dataset"
+OUTPUT_DIR = PROJECT_ROOT / "data" / "training" / "yolo_dataset"
 CLASS_MAP_PATH = PROJECT_ROOT / "data" / "yolo" / "class_map.json"
 
 # ============ 工具映射 ============
@@ -296,7 +296,7 @@ def main():
 
     # 加载 YOLO-World（首次会下载 ~25MB）
     print("\n📥 加载 YOLO-World 模型...")
-    model = YOLOWorld("yolov8s-worldv2.pt")
+    model = YOLOWorld(str(PROJECT_ROOT / "models" / "yolov8s-worldv2.pt"))
 
     all_results = []
 

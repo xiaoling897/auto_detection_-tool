@@ -7,11 +7,10 @@ venv/
 build/
 dist/
 
-# 大文件：训练数据集 / 训练输出 / 可下载的预训练权重（不进 git，太大）
-/data/yolo_dataset/
-/data/runs/
-/yolov8n.pt
-/yolov8s-worldv2.pt
+# 大文件：训练数据集 / 标注中间产物 / 训练输出（全在 data/training/ 下，不进 git，太大）
+/data/training/
+# 可下载的预训练底座权重（放 models/，不进 git，太大）
+/models/
 
 # 临时/系统
 *.log

@@ -1,8 +1,7 @@
 """Tkinter GUI：实时扫描模式（检测后端自动选择：有 data/yolo/best.pt 用 YOLO，否则 SIFT；3 秒滑动窗口防抖）
 
 工作流：
-  - 摄像头模式（双线程实时）：采集线程持续读帧并实时显示；检测线程在后台连续跑
-    YOLO/SIFT，只回写"最近识别时间戳 + 框"。推理慢只拖慢检测刷新率，视频始终流畅。
+  - 摄像头模式：持续读帧 → 每 0.4s 跑一次 SIFT 特征匹配 → 记录每个工具的最近识别时间戳
   - 静态图模式：弹文件框选图 → 检测一次 → 立即刷新列表
   - 右侧列表全量显示全部工具，识别中的（✓ 绿）排上面，未识别的（✗ 红）排下面
   - 列表 UI 每 3 秒刷新一次（不实时刷新，避免闪烁）；可见性窗口 3 秒
@@ -25,24 +24,10 @@ from .loader import load_tools, load_tool_names
 from .utils import DATA_DIR, imread_unicode
 from .voice import VoiceReporter
 
+DETECT_INTERVAL = 0.4       # 检测节流（CPU 友好）
 UI_REFRESH_INTERVAL = 3.0   # 列表 UI 刷新节奏
-DETECT_INTERVAL = 0.4       # 检测限频：每 N 秒推理一次（其余时间只读帧+叠最近的框，保证视频顺）
 VISIBILITY_WINDOW = 3.0     # 工具可见性窗口：最近 N 秒内识别到才显示
 SPEAK_INTERVAL = 8.0        # 语音播报间隔
-
-# 诊断日志：写到 exe 同级 data/run_diag.txt（windowed 包没控制台也能留痕），同时打印。
-# 排查"卡 + 识别不出"用——记录后端、单次推理耗时、检测速率、显示帧率、读帧耗时。
-DIAG_PATH = DATA_DIR / "run_diag.txt"
-
-
-def diag(msg):
-    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
-    print(line)
-    try:
-        with open(DIAG_PATH, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except Exception:
-        pass
 
 
 class ToolDetectionApp:
@@ -96,17 +81,6 @@ class ToolDetectionApp:
         self.last_counts = {}    # 工具名 -> 上一帧 RANSAC 内点数
         self.last_source = {}    # 工具名 -> 上一帧命中来源（"强"/"弱"/"色"）
         self.detect_threshold = 10   # 上一帧有效阈值（自适应，诊断显示用）
-
-        # 单线程实时循环：一个检测线程里"读帧→限频推理→叠框→显示→刷列表"一条龙跑完。
-        # 不再拆采集/推理双线程——纯 CPU 较弱机器上双线程会让推理吃满核、把显示线程饿死，
-        # 导致开头几秒不出检测、视频卡顿、框叠不上。单线程没有线程互抢，开局第一帧就出结果。
-        self._last_boxes = []            # 最近一次 YOLO 推理的框，每帧叠加到实时画面 → 框常驻不闪
-        self._last_annotated = None      # 最近一次 SIFT 标注帧（SIFT 回退用）
-
-        diag("=" * 50)
-        diag(f"启动诊断：后端={'YOLO' if self.use_yolo else 'SIFT(回退)'}, "
-             f"cpu_count={os.cpu_count()}, 工具数={len(self.tools)}, "
-             f"加载错误={self.model_error or '无'}")
 
         self.create_ui()
 
@@ -292,95 +266,6 @@ class ToolDetectionApp:
             return list(self.tools)
         return [t for t in self.tools if t.get("des") is not None]
 
-    # 打开摄像头的尝试矩阵：按顺序逐个试，第一个出真画面的就用。
-    # 排序原则：旧 USB 摄像头惯用的「DSHOW + 强设 720p + 不改格式」放最前，保证老设备零回退；
-    # 后面几项专为 4K UVC 直播摄像机（如海康 DS-UVC-U168R）兜底——
-    #   · 加 MJPG：4K/USB 机常常只有压缩流才出画面，不设就给原始大帧或干脆不出流；
-    #   · 换 MSMF 后端：DSHOW 对现代 4K UVC 经常打不开或卡 4K 大帧，MSMF 往往更稳；
-    #   · 放开分辨率（native=用摄像头默认值）：有些 4K 机拒绝被设成 720p，只好接受其原生分辨率。
-    # (backend, 后端名, 是否强设720p, 是否设MJPG)
-    _CAM_ATTEMPTS = [
-        (cv2.CAP_DSHOW, "DSHOW", True,  False),
-        (cv2.CAP_DSHOW, "DSHOW", True,  True),
-        (cv2.CAP_MSMF,  "MSMF",  True,  False),
-        (cv2.CAP_MSMF,  "MSMF",  True,  True),
-        (cv2.CAP_MSMF,  "MSMF",  False, False),  # native 分辨率兜底
-        (cv2.CAP_DSHOW, "DSHOW", False, False),
-    ]
-
-    def _try_open(self, index, flag, force_720p, use_mjpg, warmup_frames):
-        """按指定后端/分辨率/格式打开一次，预热读帧判断是否有真画面。
-
-        返回 (cap 或 None, opened)：
-          - cap 非 None  → 出了真画面，已配好，可直接用；
-          - cap 为 None 且 opened=True  → 设备能打开但没出可用画面（黑/灰屏或出流失败）；
-          - cap 为 None 且 opened=False → 这个设备号/后端根本打不开。
-        opened 用于上层判断「0 号是否存在摄像头子系统」，决定要不要继续往后探。
-        """
-        cap = cv2.VideoCapture(index, flag)
-        if not cap.isOpened():
-            cap.release()
-            return None, False
-
-        # 关键：分辨率/格式必须在预热读帧之前设好。旧代码先用默认分辨率预热、之后才设 720p，
-        # 4K 机就会拿 3840x2160 大帧预热，读帧奇慢——这正是换 4K 摄像头后"卡 + 打不开"的元凶之一。
-        if use_mjpg:
-            try:
-                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-            except Exception:
-                pass
-        if force_720p:
-            # 1280x720：低分辨率会让远处/小工具像素不足而漏检，先保检测能力（之前降到 640x480 识别不出）。
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        # 缓冲设为 1：丢掉积压旧帧，始终拿最新画面，消除"慢半拍"
-        try:
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        except Exception:
-            pass
-
-        for _ in range(warmup_frames):
-            ret, frame = cap.read()
-            if ret and frame is not None and float(frame.std()) > 6.0:
-                return cap, True
-            time.sleep(0.05)
-
-        cap.release()
-        return None, True
-
-    def _open_camera(self, max_index=2, warmup_frames=8):
-        """打开一个可用摄像头，返回配置好的 VideoCapture（失败返回 None）。
-
-        换摄像头也能用——不写死设备号、不写死后端、不靠单帧判断：
-          - 逐个设备号（0→max_index，外接 USB 常在 1、2）× 逐项尝试矩阵 _CAM_ATTEMPTS
-            （DSHOW/MSMF 双后端 + 720p/native 双分辨率 + 选配 MJPG），第一个出真画面的就用。
-          - 关键早退出：若 0 号在**所有后端**都连打开都失败，说明基本没有摄像头子系统，直接放弃，
-            不再往后探。因为 DSHOW 探测不存在的设备号每个要卡 7-9s，无摄像头的机器否则要白等。
-          - 预热读最多 warmup_frames 帧：很多摄像头首帧是黑/绿/花屏，读到方差够大（std>6.0，
-            能区分真画面与均匀灰屏的虚拟设备）就判定可用，避免把预热慢的真摄像头误判成无摄像头。
-        """
-        for index in range(max_index + 1):
-            opened_any = False
-            for flag, bname, force_720p, use_mjpg in self._CAM_ATTEMPTS:
-                cap, opened = self._try_open(index, flag, force_720p, use_mjpg, warmup_frames)
-                opened_any = opened_any or opened
-                res = f"{'720p' if force_720p else 'native'}/{'MJPG' if use_mjpg else '默认'}"
-                if cap is not None:
-                    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                    diag(f"摄像头探测：设备{index} {bname} {res} → ✅ 打开成功 {w}x{h}")
-                    return cap
-                # 失败也记日志（写进 run_diag.txt），方便在接了摄像头那台机器远程定位卡在哪
-                why = "连打开都失败" if not opened else "能打开但读不到真画面(忙/格式不出流)"
-                diag(f"摄像头探测：设备{index} {bname} {res} → ✗ {why}")
-            # 0 号所有后端都打不开 → 基本无摄像头，立即放弃，避免后续设备号的 7-9s 空卡
-            if index == 0 and not opened_any:
-                diag("摄像头探测：0号所有后端都打不开 → 判定无摄像头子系统，停止探测")
-                break
-
-        diag("⚠️ 未找到可用摄像头，回退到选图片模式")
-        return None
-
     def start_detection(self):
         if self.detector_engine is None:
             msg = (
@@ -402,8 +287,23 @@ class ToolDetectionApp:
         self.static_frame = None
 
         if self.cap is None:
-            self.cap = self._open_camera()
-            self.use_camera = self.cap is not None
+            cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+            if cap.isOpened():
+                ret, test_frame = cap.read()
+                # 有些 Windows 没有真实摄像头时，VideoCapture 仍会"打开"一个返回
+                # 大片均匀灰屏的虚拟设备——首帧方差极小说明不是真画面，也按无摄像头处理，
+                # 回退到让用户选图片。
+                usable = (ret and test_frame is not None
+                          and float(test_frame.std()) > 6.0)
+                if usable:
+                    self.cap = cap
+                    self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                    self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                    self.use_camera = True
+                else:
+                    cap.release()
+            else:
+                cap.release()
 
         if not self.use_camera:
             initial_dir = str(DATA_DIR / "samples")
@@ -426,10 +326,6 @@ class ToolDetectionApp:
 
         self.running = True
         self.should_speak = True
-
-        # 清掉上一轮残留的框，避免新一轮开头闪到旧画面
-        self._last_boxes = []
-        self._last_annotated = None
 
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
@@ -464,8 +360,6 @@ class ToolDetectionApp:
 
         self.last_seen = {}
         self.last_counts = {}
-        self._last_boxes = []
-        self._last_annotated = None
         try:
             self.refresh_visible_list()
             self.video_label.configure(image="", text="点击立即检测")
@@ -496,21 +390,9 @@ class ToolDetectionApp:
             self.stop_detection()
 
     def _camera_loop(self):
-        """单线程实时循环：读帧 → 限频推理 → 每帧叠最近的框 → 显示 → 刷列表，一条龙跑完。
-
-        为什么单线程：纯 CPU 较弱机器上，"采集/推理双线程"会让 torch 推理吃满核、把显示线程
-        饿死——表现就是开头几秒不出检测、视频卡顿、框叠不上、语音误报全部缺失。单线程没有线程
-        互抢，开局第一帧就出结果；DETECT_INTERVAL 限频让出大部分时间给读帧+显示，视频依旧顺。
-        框常驻：每帧都把最近一次推理的框叠到当前实时画面上（不是只在推理那一帧画），所以不闪。
-        """
         last_speak = 0.0
         last_detect = 0.0
         last_ui_refresh = 0.0
-        # 诊断计数
-        diag_t0 = time.time()
-        diag_frames = 0
-        diag_infer_ms = 0.0
-        diag_infers = 0
         while self.running and self.cap is not None:
             ret, frame = self.cap.read()
             if not ret:
@@ -518,44 +400,27 @@ class ToolDetectionApp:
                 continue
 
             now = time.time()
-            diag_frames += 1
-
-            # 限频推理：到点才跑一次，更新"最近的框 + last_seen + 置信度"
+            display = frame
             if now - last_detect >= DETECT_INTERVAL:
-                last_detect = now
-                t_infer = time.time()
-                try:
-                    if self.use_yolo:
-                        detected, counts, boxes = self.detector_engine.infer(frame)
-                        self._last_boxes = boxes
-                    else:
-                        detected, annotated, counts = self.detector_engine.detect(frame)
-                        self._last_annotated = annotated
-                except Exception as e:
-                    diag(f"检测出错: {e}")
-                    detected, counts = set(), {}
-                diag_infer_ms += (time.time() - t_infer) * 1000
-                diag_infers += 1
-
+                detected, display, counts = self.detector_engine.detect(frame)
+                # 每帧严格检测，命中即更新 last_seen；多帧累计 + 3 秒窗口决定"在场/缺失"。
+                # 严格检测在场景里没有持久假阳性，所以工具拿走后 3 秒内会自动掉为缺失。
                 for name in detected:
                     self.last_seen[name] = now
                 self.last_counts.update(counts)
+                # 来源/阈值整帧替换（SIFT 才有；YOLO 无此属性，getattr 兜底）
                 self.last_source = dict(getattr(self.detector_engine, "last_source", {}))
                 self.detect_threshold = getattr(self.detector_engine, "last_threshold", 0)
+                last_detect = now
+                # 诊断：每帧把"检测到的工具 + 数值(SIFT内点/YOLO置信%) + 来源"打到控制台
                 hits = " ".join(
                     f"{n}={counts.get(n, 0)}{self.last_source.get(n, '')}"
                     for n in sorted(detected))
                 print(f"[检测 {len(detected)}个] {hits or '(空)'}")
 
-            # 每帧都把"最近一次检测的框"叠到当前实时帧上 → 框常驻、跟着实时画面、不闪
-            if self.use_yolo:
-                display = (self.detector_engine.render(frame, self._last_boxes)
-                           if self._last_boxes else frame)
-            else:
-                display = self._last_annotated if self._last_annotated is not None else frame
             self._show_frame(display)
 
-            # 列表 UI 每 3 秒刷新一次（不实时刷新，避免行频繁 pack/forget 抖动）
+            # 列表 UI 每 3 秒刷新一次（不实时刷新，避免闪烁）
             if now - last_ui_refresh >= UI_REFRESH_INTERVAL:
                 self.refresh_visible_list()
                 last_ui_refresh = now
@@ -564,18 +429,7 @@ class ToolDetectionApp:
                 self.speak_missing()
                 last_speak = now
 
-            # 每 2 秒报一次：显示帧率 + 平均推理耗时（写进 run_diag.txt 便于远程诊断）
-            if now - diag_t0 >= 2.0:
-                fps = diag_frames / (now - diag_t0)
-                avg_infer = diag_infer_ms / max(diag_infers, 1)
-                diag(f"单线程：显示 {fps:.1f} fps，推理 {avg_infer:.0f} ms × {diag_infers} 次/2s，"
-                     f"窗口内命中 {len([n for n, t in self.last_seen.items() if now - t < VISIBILITY_WINDOW])} 个")
-                diag_t0 = now
-                diag_frames = 0
-                diag_infer_ms = 0.0
-                diag_infers = 0
-
-            time.sleep(0.01)
+            time.sleep(0.02)
 
     def _static_once(self):
         now = time.time()

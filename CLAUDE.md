@@ -24,16 +24,28 @@ src/                    # 核心源码（包，被 run.py 引用）
   loader.py             # smart_tools.json 解析（load_tool_names YOLO 用，load_tools SIFT 用）
   voice.py              # Windows SAPI 语音
   utils.py              # 中文路径读图 + DATA_DIR 路径解析
-data/                   # 所有数据资源
+data/                   # 数据资源（根目录只放运行时需要的）
   smart_tools.json      # 工具名清单（YOLO 模式只读 name 字段）
   yolo/
     best.pt             # ⭐ YOLO 训练产物，用户自己训练后放这里
     class_map.json      # 英文类名 → 中文显示名映射
   smart_templates/      # 旧 SIFT 模板图（YOLO 不用，保留兼容）
   samples/              # 测试用图片
-scripts/                # 一次性脚本
+  training/             # ⭐ 训练相关全在这（整个目录已 gitignore，不进仓库）
+    photo/              #   原始拍摄图（sam_autolabel 的输入源）
+    new_shots2/         #   摄像头补拍的原图
+    autolabel/          #   SAM 自动标注产物（prepare_dataset 的输入）
+    label_multi/        #   labelImg 手工标注的多工具合照
+    label_new*/ label_full/  # 其它手工标注批次（prepare_dataset 按 label_* 自动合并）
+    yolo_dataset/       #   最终 YOLO 训练集（prepare_dataset 切分产物，含 data.yaml）
+    runs/               #   train_yolo 的训练日志/权重输出
+models/                 # 预训练底座权重（已 gitignore，可重新下载）
+  yolo11s.pt            #   训练底座（train_yolo.py）
+  FastSAM-s.pt          #   自动标注底座（sam_autolabel.py / sam_boxall.py）
+scripts/                # 一次性脚本（数据路径指向 data/training/，权重路径指向 models/）
 tests/                  # 测试
 ```
+> 注：`VisionGuard-AI_Detection_System/`（手势/姿态检测，独立 git 仓库）原先嵌在本项目里，已移出到 `d:/VisionGuard-AI_Detection_System`，与本项目无关。
 
 ## 检测算法（关键，别改坏）
 
@@ -67,7 +79,8 @@ tests/                  # 测试
 **滑动窗口 + 全量展示**：右侧清单**始终列出全部 11 个工具**，但**识别到的（✓ 绿）排上面，未识别的（✗ 红，名字灰）排下面**。识别判定依据"最近 `VISIBILITY_WINDOW = 3.0s` 内 `last_seen` 有更新"——工具拿走 ≥3s 会从上半区掉到下半区，放回镜头前下一次检测命中就升上去。
 
 - 检测线程仍每 `DETECT_INTERVAL = 0.4s` 跑一次（实时更新 `last_seen` 时间戳）
-- UI 列表每 `UI_REFRESH_INTERVAL = 3.0s` 刷新一次（不实时刷新，避免行频繁 pack/forget 抖动）
+- **单线程实时循环**（[_camera_loop](src/gui.py)）：一个检测线程里"读帧 → 每 `DETECT_INTERVAL = 0.4s` 推理一次 → 每帧叠最近的框 → 显示 → 每 `UI_REFRESH_INTERVAL = 3.0s` 刷列表"一条龙跑完。**不用双线程**——纯 CPU 较弱机器上"采集/推理双线程"会让 torch 推理吃满核、把显示线程饿死，表现为开头几秒不出检测、视频卡顿、框叠不上、语音误报全部缺失。单线程没有线程互抢，开局第一帧就出结果
+- **框常驻**：每帧都把最近一次推理的框（YOLO 的 `_last_boxes`）叠到当前实时帧上，不是只在推理那一帧画，所以框跟着实时画面、不闪
 - 每次 refresh 都先 forget 所有行再按"识别优先 + 配置顺序"重新 pack——`recognized + unrecognized` 两组拼接，组内保持工具配置顺序，所以视觉上稳定不抖
 - 状态指示：✓ 绿（识别）/ ✗ 红（未识别）；内点数 ≥10 绿、5-9 黄、<5 灰——未识别行整体灰显
 - 启动时立即调一次 `refresh_visible_list`，让 11 个工具初始全部以 ✗ 显示
@@ -88,9 +101,13 @@ tests/                  # 测试
 - **ultralytics import 慢**（2-5s）：[src/yolo_detector.py](src/yolo_detector.py) 把 `from ultralytics import YOLO` 放在 `__init__` 里延迟 import，避免没用 YOLO 时也付出这个代价。
 - **中文标签画框**：cv2.putText 不支持中文，[src/yolo_detector.py](src/yolo_detector.py) 用 PIL + 微软雅黑（`C:/Windows/Fonts/msyh.ttc`）画中文标签，cv2 只画矩形框——单帧多框时合并一次 cv2↔PIL 转换提速。
 - **中文路径**：Windows + 中文路径下 `cv2.imread` 会**静默失败**，必须用 [src.utils.imread_unicode](src/utils.py)（`np.frombuffer` + `cv2.imdecode`）。当前 GUI 文件框选静态图时用的就是这个。
-- **摄像头打开慢**：Windows DSHOW 后端，无摄像头时 `VideoCapture(0, CAP_DSHOW)` 会**卡 7-9 秒**才返回失败，这是 OpenCV 行为。GUI 每次点"立即检测"都会重新探测，没办法绕过。
+- **摄像头打开慢 / 换 4K 摄像头打不开**：[_open_camera](src/gui.py) 用「尝试矩阵」`_CAM_ATTEMPTS` 逐项试——`DSHOW`/`MSMF` 双后端 × `720p`/`native` 双分辨率 × 选配 `MJPG`，第一项就是旧 USB 摄像头惯用的「DSHOW+720p+默认格式」(老设备零回退)，后面几项给 4K UVC 直播摄像机(如海康 DS-UVC-U168R)兜底。
+  - **分辨率/格式必须在预热读帧之前设**：旧代码先用默认分辨率预热、之后才设 720p，4K 机就拿 3840×2160 大帧预热导致读帧奇慢——这是换 4K 摄像头后"卡+打不开"的元凶之一。
+  - **4K UVC 常需 `MJPG`**：不设压缩格式时有些 4K/USB 机只给原始大帧或不出流；`MSMF` 后端对现代 4K UVC 通常比 `DSHOW` 更稳。
+  - **无摄像头快速回退**：只有 `0 号在所有后端都连打开都失败` 才放弃(不再往后探不存在的设备号，DSHOW 探测不存在号每个卡 7-9s)。实测无摄像头约 0.08s 返回 None。
+  - **硬件侧排查**(程序无能为力的情况)：直播摄像机要 USB-C 数据线接电脑(很多 C 口线只充电不传数据)、ON/OFF 拨 ON、4K@8.6W 常需插 DC 12V。先用 [scripts/probe_camera.py](scripts/probe_camera.py) 枚举 0~3 号确认 Windows 是否认到——全"打不开"就是接线/供电/驱动问题，跟程序无关。
 - **`smart_tools.json` 的 `features` 字段是历史遗留**（旧 ORB descriptors，4.8MB）。YOLO 模式只读 `name` 字段（[load_tool_names](src/loader.py)）。保留 features 是为旧脚本兼容。
-- **检测线程更新 Tkinter UI**：现有代码从 detection 线程直接调 `.config()` / `pack()`，Tkinter 严格上非线程安全但实际能用——别加锁也别引入信号机制，保持现状。
+- **检测线程直接更新 Tkinter UI**：`_camera_loop` / `_static_once` 在 detection 线程里直接调 `.config()` / `pack()` / `_show_frame()`。Tkinter 严格上非线程安全但单线程模型下实际稳定能用——别再拆成"采集线程+推理线程+主线程定时器"那套（试过，在弱 CPU 上推理饿死显示线程，反而卡顿+开头不出检测）。保持单线程现状。
 
 ## 常见操作
 
