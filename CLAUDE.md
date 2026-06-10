@@ -79,7 +79,11 @@ tests/                  # 测试
 **滑动窗口 + 全量展示**：右侧清单**始终列出全部 11 个工具**，但**识别到的（✓ 绿）排上面，未识别的（✗ 红，名字灰）排下面**。识别判定依据"最近 `VISIBILITY_WINDOW = 3.0s` 内 `last_seen` 有更新"——工具拿走 ≥3s 会从上半区掉到下半区，放回镜头前下一次检测命中就升上去。
 
 - 检测线程仍每 `DETECT_INTERVAL = 0.4s` 跑一次（实时更新 `last_seen` 时间戳）
-- **单线程实时循环**（[_camera_loop](src/gui.py)）：一个检测线程里"读帧 → 每 `DETECT_INTERVAL = 0.4s` 推理一次 → 每帧叠最近的框 → 显示 → 每 `UI_REFRESH_INTERVAL = 3.0s` 刷列表"一条龙跑完。**不用双线程**——纯 CPU 较弱机器上"采集/推理双线程"会让 torch 推理吃满核、把显示线程饿死，表现为开头几秒不出检测、视频卡顿、框叠不上、语音误报全部缺失。单线程没有线程互抢，开局第一帧就出结果
+- **双线程解耦实时**（[_camera_loop](src/gui.py) + [_inference_worker](src/gui.py)）：
+  - **显示线程**（`_camera_loop`）：持续读帧 → 每帧用 `render_live` 轻量叠最近的框 → 显示 → 每 `UI_REFRESH_INTERVAL = 3.0s` 刷列表。永远满帧率，不等推理。
+  - **推理线程**（`_inference_worker`）：后台每 `DETECT_INTERVAL = 0.4s` 取最新帧跑 YOLO，只回写 `_last_boxes`/`last_seen`/`last_counts`，**不碰 Tkinter**（线程安全）。
+  - 两线程靠 `_frame_lock` + `_latest_frame` 传帧。推理慢只拖慢"框刷新率"，**绝不阻塞视频** —— 这是用重模型（yolo11s 9.4M）也不卡的根因修复（2026-06，详见 [tests/bench_camera_smoothness.py](tests/bench_camera_smoothness.py)，单线程→双线程显示帧率实测提升数倍）。
+  - **为什么这次双线程不会"饿死显示"**（之前单线程版踩过的坑）：① `yolo_detector` 里 `torch.set_num_threads(n_cpu-2)` 给显示线程留核；② 显示线程每帧只做 cv2 画框 + **缓存好的中文标签贴图**（`render_live`/`_label_sprite`），绝不每帧整幅 `cv2<->PIL` 转换（那是旧版每帧十几 ms 的卡顿来源）。两条缺一不可。
 - **框常驻**：每帧都把最近一次推理的框（YOLO 的 `_last_boxes`）叠到当前实时帧上，不是只在推理那一帧画，所以框跟着实时画面、不闪
 - 每次 refresh 都先 forget 所有行再按"识别优先 + 配置顺序"重新 pack——`recognized + unrecognized` 两组拼接，组内保持工具配置顺序，所以视觉上稳定不抖
 - 状态指示：✓ 绿（识别）/ ✗ 红（未识别）；内点数 ≥10 绿、5-9 黄、<5 灰——未识别行整体灰显
@@ -107,7 +111,7 @@ tests/                  # 测试
   - **无摄像头快速回退**：只有 `0 号在所有后端都连打开都失败` 才放弃(不再往后探不存在的设备号，DSHOW 探测不存在号每个卡 7-9s)。实测无摄像头约 0.08s 返回 None。
   - **硬件侧排查**(程序无能为力的情况)：直播摄像机要 USB-C 数据线接电脑(很多 C 口线只充电不传数据)、ON/OFF 拨 ON、4K@8.6W 常需插 DC 12V。先用 [scripts/probe_camera.py](scripts/probe_camera.py) 枚举 0~3 号确认 Windows 是否认到——全"打不开"就是接线/供电/驱动问题，跟程序无关。
 - **`smart_tools.json` 的 `features` 字段是历史遗留**（旧 ORB descriptors，4.8MB）。YOLO 模式只读 `name` 字段（[load_tool_names](src/loader.py)）。保留 features 是为旧脚本兼容。
-- **检测线程直接更新 Tkinter UI**：`_camera_loop` / `_static_once` 在 detection 线程里直接调 `.config()` / `pack()` / `_show_frame()`。Tkinter 严格上非线程安全但单线程模型下实际稳定能用——别再拆成"采集线程+推理线程+主线程定时器"那套（试过，在弱 CPU 上推理饿死显示线程，反而卡顿+开头不出检测）。保持单线程现状。
+- **只有显示线程碰 Tkinter**：`_camera_loop` / `_static_once`（显示线程）直接调 `.config()` / `pack()` / `_show_frame()`，Tkinter 严格上非线程安全但实际稳定能用。**推理线程 `_inference_worker` 绝不能碰任何 Tkinter 控件**，只写普通 dict/list（`_last_boxes` 等）——这是双线程能安全跑的前提。要再加重负载（如额外后处理）也放推理线程，别塞进显示线程，否则视频会卡。
 
 ## 常见操作
 
@@ -119,10 +123,19 @@ python tests/test_image_detect.py data/samples/all_tools.jpg
 # 重建 smart_tools.json（加新模板后）
 python scripts/extract_features.py
 
+<<<<<<< HEAD
+# 打包 EXE（onedir 文件夹分发，自动把 data/yolo/best.pt 复制进产物）
+python scripts/build_exe.py             # 正式版：--windowed 无黑窗
+python scripts/build_exe.py --console   # 调试版：保留黑窗，能看 diag() 实时诊断 + run_diag.txt
+# 产物：dist/智能工具检测系统/  —— 整个文件夹拷给别人即可双击运行（含 _internal/ 依赖 + data/）
+# 注：构建会在根目录生成 智能工具检测系统.spec（PyInstaller 自动产物，已 gitignore，可随时删）
+# Windows GBK 控制台跑构建/训练脚本前先设 PYTHONIOENCODING=utf-8，否则 emoji print 会 UnicodeEncodeError
+=======
 # 打包 EXE
 python scripts/build_exe.py
 
 
 
 
+>>>>>>> 44ab011408d0834e3e210402c1a0d5899e00fb2d
 ```
