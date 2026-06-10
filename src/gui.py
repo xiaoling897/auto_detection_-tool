@@ -34,6 +34,26 @@ DETECT_INTERVAL = 0.4       # 检测限频：每 N 秒推理一次（其余时�
 VISIBILITY_WINDOW = 3.0     # 工具可见性窗口：最近 N 秒内识别到才显示
 SPEAK_INTERVAL = 8.0        # 语音播报间隔
 
+# ---- 配色（统一暗色主题，集中放这里方便整体换肤）----
+C_BG = "#0f1629"            # 窗口主背景（深海军蓝）
+C_PANEL = "#16213e"         # 面板背景
+C_CARD = "#1d2b4a"          # 卡片/工具行背景（比面板亮一点）
+C_VIDEO = "#0a0e1a"         # 视频区背景
+C_BORDER = "#2a3a5c"        # 描边
+C_ACCENT = "#38bdf8"        # 主题强调色（青）
+C_TEXT = "#e6edf3"          # 主文字
+C_MUTED = "#7d8aa0"         # 次要/未识别文字
+C_GREEN = "#22c55e"         # 识别成功
+C_AMBER = "#f59e0b"         # 中等置信度
+FONT = "Microsoft YaHei UI"
+
+# 按钮配色 (常态, 悬停)
+BTN_CAM = ("#16a34a", "#22c55e")
+BTN_VIDEO = ("#2563eb", "#3b82f6")
+BTN_IMAGE = ("#0891b2", "#06b6d4")
+BTN_STOP = ("#dc2626", "#ef4444")
+BTN_RESET = ("#475569", "#64748b")
+
 # 诊断日志：写到 exe 同级 data/run_diag.txt（windowed 包没控制台也能留痕），同时打印。
 # 排查"卡 + 识别不出"用——记录后端、单次推理耗时、检测速率、显示帧率、读帧耗时。
 DIAG_PATH = DATA_DIR / "run_diag.txt"
@@ -53,8 +73,9 @@ class ToolDetectionApp:
     def __init__(self, root):
         self.root = root
         self.root.title("智能工具检测系统")
-        self.root.geometry("1400x900")
-        self.root.configure(bg="#1a1a2e")
+        self.root.geometry("1480x920")
+        self.root.minsize(1200, 760)
+        self.root.configure(bg=C_BG)
 
         self.voice = VoiceReporter()
 
@@ -130,101 +151,129 @@ class ToolDetectionApp:
 
     # ---------------- UI ----------------
 
+    def _make_button(self, parent, text, colors, command, state="normal"):
+        """扁平现代风按钮 + 悬停高亮。colors=(常态色, 悬停色)。"""
+        base, hover = colors
+        btn = tk.Button(parent, text=text, command=command, state=state,
+                        font=(FONT, 13, "bold"), bg=base, fg="white",
+                        activebackground=hover, activeforeground="white",
+                        disabledforeground="#9aa6bd",
+                        relief="flat", bd=0, cursor="hand2", padx=16, pady=11)
+        btn._base, btn._hover = base, hover
+        btn.bind("<Enter>",
+                 lambda e: btn.config(bg=hover) if str(btn["state"]) == "normal" else None)
+        btn.bind("<Leave>",
+                 lambda e: btn.config(bg=base) if str(btn["state"]) == "normal" else None)
+        return btn
+
+    def _set_buttons_running(self, running):
+        """运行中：禁用三个检测按钮、启用停止；停止时反之。顺带复位悬停残留色。"""
+        for b in (self.cam_btn, self.video_btn, self.image_btn):
+            b.config(state="disabled" if running else "normal", bg=b._base)
+        self.stop_btn.config(state="normal" if running else "disabled",
+                             bg=self.stop_btn._base)
+
     def create_ui(self):
-        main_frame = tk.Frame(self.root, bg="#1a1a2e")
-        main_frame.pack(fill="both", expand=True)
+        main = tk.Frame(self.root, bg=C_BG)
+        main.pack(fill="both", expand=True)
 
-        # 左侧 - 视频
-        left_frame = tk.Frame(main_frame, bg="#1a1a2e")
-        left_frame.pack(side="left", fill="both", expand=True, padx=10, pady=10)
+        # ---- 顶部标题栏 ----
+        header = tk.Frame(main, bg=C_BG)
+        header.pack(fill="x", padx=22, pady=(16, 6))
+        tk.Label(header, text="🔧 智能工具检测系统", font=(FONT, 24, "bold"),
+                 bg=C_BG, fg=C_ACCENT).pack(side="left")
+        badge_bg = "#14532d" if self.use_yolo else "#5b3a13"
+        badge_fg = C_GREEN if self.use_yolo else C_AMBER
+        self.backend_badge = tk.Label(
+            header, text=f"  {'YOLO 深度学习' if self.use_yolo else 'SIFT 模板匹配'}  ",
+            font=(FONT, 10, "bold"), bg=badge_bg, fg=badge_fg, padx=4, pady=3)
+        self.backend_badge.pack(side="right", pady=6)
 
-        title_label = tk.Label(left_frame, text="🔧 智能工具检测系统",
-                               font=("Microsoft YaHei UI", 28, "bold"),
-                               bg="#1a1a2e", fg="#00d4ff")
-        title_label.pack(pady=15)
+        # ---- 主体：左视频 + 右列表 ----
+        body = tk.Frame(main, bg=C_BG)
+        body.pack(fill="both", expand=True, padx=22, pady=(0, 16))
 
-        video_container = tk.Frame(left_frame, bg="#0d1117", relief="ridge", bd=2)
-        video_container.pack(fill="both", expand=True, pady=10)
+        left = tk.Frame(body, bg=C_BG)
+        left.pack(side="left", fill="both", expand=True)
 
-        self.video_label = tk.Label(video_container, bg="#0d1117", text="点击立即检测")
-        self.video_label.pack(fill="both", expand=True, padx=5, pady=5)
+        # 视频卡片（细描边）
+        video_card = tk.Frame(left, bg=C_VIDEO, highlightbackground=C_BORDER,
+                              highlightthickness=1, bd=0)
+        video_card.pack(fill="both", expand=True)
+        self.video_label = tk.Label(video_card, bg=C_VIDEO, fg=C_MUTED,
+                                    text="📷  点击下方按钮开始检测",
+                                    font=(FONT, 15))
+        self.video_label.pack(fill="both", expand=True, padx=6, pady=6)
 
-        # 按钮
-        button_frame = tk.Frame(left_frame, bg="#1a1a2e")
-        button_frame.pack(pady=20)
+        # ---- 按钮栏 ----
+        bar = tk.Frame(left, bg=C_BG)
+        bar.pack(fill="x", pady=(14, 0))
+        self.cam_btn = self._make_button(bar, "📷 摄像头检测", BTN_CAM, self.detect_camera)
+        self.cam_btn.pack(side="left")
+        self.video_btn = self._make_button(bar, "🎬 视频检测", BTN_VIDEO, self.open_video)
+        self.video_btn.pack(side="left", padx=10)
+        self.image_btn = self._make_button(bar, "🖼 图片检测", BTN_IMAGE, self.detect_image)
+        self.image_btn.pack(side="left")
+        # 弹簧：把"停止/清空"推到右边
+        tk.Frame(bar, bg=C_BG).pack(side="left", expand=True, fill="x")
+        self.stop_btn = self._make_button(bar, "⏹ 停止检测", BTN_STOP,
+                                          self.stop_detection, state="disabled")
+        self.stop_btn.pack(side="left", padx=(0, 10))
+        self.reset_btn = self._make_button(bar, "🗑 清空显示", BTN_RESET, self.reset_display)
+        self.reset_btn.pack(side="left")
 
-        self.start_btn = tk.Button(button_frame, text="▶ 立即检测",
-                                   font=("Microsoft YaHei UI", 16, "bold"),
-                                   bg="#238636", fg="white", width=14, height=2,
-                                   relief="flat", cursor="hand2",
-                                   command=self.start_detection)
-        self.start_btn.pack(side="left", padx=15)
+        # ---- 右侧工具清单 ----
+        right = tk.Frame(body, bg=C_PANEL, width=360)
+        right.pack(side="right", fill="y", padx=(18, 0))
+        right.pack_propagate(False)
 
-        self.stop_btn = tk.Button(button_frame, text="⏹ 停止检测",
-                                  font=("Microsoft YaHei UI", 16, "bold"),
-                                  bg="#da3633", fg="white", width=14, height=2,
-                                  relief="flat", cursor="hand2",
-                                  command=self.stop_detection, state="disabled")
-        self.stop_btn.pack(side="left", padx=15)
+        rhead = tk.Frame(right, bg=C_PANEL)
+        rhead.pack(fill="x", padx=18, pady=(18, 8))
+        tk.Label(rhead, text="📋 已识别工具", font=(FONT, 15, "bold"),
+                 bg=C_PANEL, fg=C_TEXT).pack(side="left")
+        self.count_badge = tk.Label(rhead, text="0/0", font=(FONT, 12, "bold"),
+                                    bg=C_CARD, fg=C_GREEN, padx=10, pady=2)
+        self.count_badge.pack(side="right")
 
-        self.video_btn = tk.Button(button_frame, text="🎬 打开视频",
-                                   font=("Microsoft YaHei UI", 16, "bold"),
-                                   bg="#1f6feb", fg="white", width=14, height=2,
-                                   relief="flat", cursor="hand2",
-                                   command=self.open_video)
-        self.video_btn.pack(side="left", padx=15)
-
-        self.reset_btn = tk.Button(button_frame, text="🔄 清空显示",
-                                   font=("Microsoft YaHei UI", 16, "bold"),
-                                   bg="#9333ea", fg="white", width=14, height=2,
-                                   relief="flat", cursor="hand2",
-                                   command=self.reset_display)
-        self.reset_btn.pack(side="left", padx=15)
-
-        # 右侧 - 工具列表
-        right_frame = tk.Frame(main_frame, bg="#16213e", width=350)
-        right_frame.pack(side="right", fill="y", padx=10, pady=10)
-
-        list_title = tk.Label(right_frame, text="📋 已识别工具",
-                              font=("Microsoft YaHei UI", 16, "bold"),
-                              bg="#16213e", fg="#00ff88")
-        list_title.pack(pady=20)
-
-        self.tool_status_frame = tk.Frame(right_frame, bg="#16213e")
-        self.tool_status_frame.pack(fill="both", expand=True, padx=15, pady=10)
+        self.tool_status_frame = tk.Frame(right, bg=C_PANEL)
+        self.tool_status_frame.pack(fill="both", expand=True, padx=12, pady=4)
 
         self.build_tool_rows()
 
-        self.stats_label = tk.Label(right_frame, text="待检测...",
-                                    font=("Microsoft YaHei UI", 12),
-                                    bg="#16213e", fg="#ffffff")
-        self.stats_label.pack(pady=20)
+        self.stats_label = tk.Label(right, text="待检测…", font=(FONT, 11),
+                                    bg=C_PANEL, fg=C_MUTED)
+        self.stats_label.pack(pady=(6, 16))
 
-        # 初始状态：所有工具显示为未识别（✗ 灰色）——必须放在 stats_label 创建之后
+        # 初始状态：所有工具显示为未识别——必须放在 stats_label 创建之后
         self.refresh_visible_list()
 
     def build_tool_rows(self):
-        """为每个工具预创建一行 widget。refresh_visible_list 决定 pack 顺序 + 状态颜色。"""
+        """为每个工具预创建一张"卡片行"。refresh_visible_list 决定 pack 顺序 + 状态颜色。"""
         for tool in self.tools:
             name = tool["name"]
-            row = tk.Frame(self.tool_status_frame, bg="#16213e")
+            row = tk.Frame(self.tool_status_frame, bg=C_CARD)
 
-            name_label = tk.Label(row, text=name,
-                                  font=("Microsoft YaHei UI", 11),
-                                  bg="#16213e", fg="#ffffff", anchor="w")
-            name_label.pack(side="left", fill="x", expand=True)
+            # 左侧状态色条
+            accent = tk.Frame(row, bg="#ef4444", width=4)
+            accent.pack(side="left", fill="y")
 
-            match_label = tk.Label(row, text="--",
-                                   font=("Microsoft YaHei UI", 10),
-                                   bg="#16213e", fg="#888888", width=11)
-            match_label.pack(side="right", padx=5)
+            inner = tk.Frame(row, bg=C_CARD)
+            inner.pack(side="left", fill="both", expand=True, padx=(10, 10), pady=9)
 
-            status_indicator = tk.Label(row, text="✗",
-                                        font=("Arial", 14),
-                                        bg="#16213e", fg="#ff6b6b", width=3)
-            status_indicator.pack(side="right")
+            status_indicator = tk.Label(inner, text="✗", font=("Segoe UI Emoji", 13),
+                                        bg=C_CARD, fg="#ef4444", width=2)
+            status_indicator.pack(side="left")
+
+            name_label = tk.Label(inner, text=name, font=(FONT, 11, "bold"),
+                                  bg=C_CARD, fg=C_MUTED, anchor="w")
+            name_label.pack(side="left", fill="x", expand=True, padx=(6, 0))
+
+            match_label = tk.Label(inner, text="--", font=(FONT, 10, "bold"),
+                                   bg=C_CARD, fg=C_MUTED, width=8, anchor="e")
+            match_label.pack(side="right")
 
             tool["row"] = row
+            tool["accent"] = accent
             tool["name_label"] = name_label
             tool["status_label"] = status_indicator
             tool["match_label"] = match_label
@@ -256,54 +305,57 @@ class ToolDetectionApp:
             for tool in recognized + unrecognized:
                 row = tool["row"]
                 name = tool["name"]
-                row.pack(fill="x", pady=5)
+                row.pack(fill="x", pady=3)
 
                 is_recog = tool in recognized
                 status_label = tool.get("status_label")
                 match_label = tool.get("match_label")
                 name_label = tool.get("name_label")
+                accent = tool.get("accent")
 
                 if status_label is not None:
-                    if is_recog:
-                        status_label.config(text="✓", fg="#00ff88")
-                    else:
-                        status_label.config(text="✗", fg="#ff6b6b")
-
+                    status_label.config(text="✓" if is_recog else "✗",
+                                        fg=C_GREEN if is_recog else "#ef4444")
+                if accent is not None:
+                    accent.config(bg=C_GREEN if is_recog else "#3a4763")
                 if name_label is not None:
-                    name_label.config(fg="#ffffff" if is_recog else "#888888")
+                    name_label.config(fg=C_TEXT if is_recog else C_MUTED)
 
                 if match_label is not None:
                     count = self.last_counts.get(name, 0)
                     if self.use_yolo:
                         # YOLO 模式：count 是置信度百分比
                         if is_recog and count > 0:
-                            fg = ("#00ff88" if count >= 70 else
-                                  "#ffcc00" if count >= 50 else "#888888")
+                            fg = (C_GREEN if count >= 70 else
+                                  C_AMBER if count >= 50 else C_MUTED)
                             match_label.config(text=f"{count}%", fg=fg)
                         else:
-                            match_label.config(text="--", fg="#555555")
+                            match_label.config(text="--", fg="#4a5670")
                     else:
                         # SIFT 模式：count=内点数, thr=阈值, src=命中来源(强/弱/色)
                         thr = self.detect_threshold
                         src = self.last_source.get(name, "")
                         if is_recog:
                             if src == "色":
-                                match_label.config(text=f"色 {count}", fg="#00aaff")
+                                match_label.config(text=f"色 {count}", fg="#38bdf8")
                             elif src == "弱":
-                                match_label.config(text=f"{count}/{thr} 弱", fg="#ffcc00")
+                                match_label.config(text=f"{count}/{thr}弱", fg=C_AMBER)
                             elif src == "强":
-                                match_label.config(text=f"{count}/{thr} 强", fg="#00ff88")
+                                match_label.config(text=f"{count}/{thr}强", fg=C_GREEN)
                             else:
-                                match_label.config(text=f"{count}/{thr} 窗", fg="#888888")
+                                match_label.config(text=f"{count}/{thr}窗", fg=C_MUTED)
                         else:
                             match_label.config(
                                 text=f"{count}/{thr}" if count > 0 else "--",
-                                fg="#555555")
+                                fg="#4a5670")
 
             total = len(self._valid_tools())
+            self.count_badge.config(
+                text=f"{len(recognized)}/{total}",
+                fg=C_GREEN if recognized else C_MUTED)
             self.stats_label.config(
-                text=f"当前识别: {len(recognized)}/{total}",
-                fg="#ffffff")
+                text=f"当前识别 {len(recognized)} / {total} 个工具",
+                fg=C_TEXT)
             return len(recognized)
         except Exception as e:
             print(f"刷新列表出错: {e}")
@@ -406,70 +458,91 @@ class ToolDetectionApp:
         diag("⚠️ 未找到可用摄像头，回退到选图片模式")
         return None
 
-    def start_detection(self):
+    def _check_ready(self):
+        """检测前置检查：检测器就绪 + 有可用工具。不通过弹框并返回 False。"""
         if self.detector_engine is None:
-            msg = (
-                "检测器未就绪，无法开始检测。\n\n"
-                f"详细错误：\n{self.model_error or '未知'}"
-            )
-            messagebox.showwarning("检测器未就绪", msg)
-            return
-        valid = self._valid_tools()
-        if not valid:
+            messagebox.showwarning(
+                "检测器未就绪",
+                f"检测器未就绪，无法开始检测。\n\n详细错误：\n{self.model_error or '未知'}")
+            return False
+        if not self._valid_tools():
             messagebox.showwarning(
                 "警告",
                 "没有任何可用工具。YOLO 模式请检查 data/yolo/best.pt 和 class_map.json；"
-                "SIFT 模式请检查 data/smart_tools.json 和 data/smart_templates/。"
-            )
-            return
+                "SIFT 模式请检查 data/smart_tools.json 和 data/smart_templates/。")
+            return False
+        return True
 
-        self.use_camera = False
-        self.is_video_file = False
-        self.static_frame = None
-
-        if self.cap is None:
-            self.cap = self._open_camera()
-            self.use_camera = self.cap is not None
-
-        if not self.use_camera:
-            initial_dir = str(DATA_DIR / "samples")
-            if not os.path.isdir(initial_dir):
-                initial_dir = str(DATA_DIR)
-            file_path = filedialog.askopenfilename(
-                title="选择要检测的图片",
-                initialdir=initial_dir,
-                filetypes=[("图片文件", "*.jpg *.jpeg *.png *.bmp"), ("所有文件", "*.*")]
-            )
-            if not file_path:
-                return
-            try:
-                self.static_frame = imread_unicode(file_path)
-            except Exception:
-                self.static_frame = None
-            if self.static_frame is None:
-                messagebox.showerror("错误", f"无法读取图片：{file_path}")
-                return
-
-        self.running = True
-        self.should_speak = True
-
-        # 清掉上一轮残留的框，避免新一轮开头闪到旧画面
+    def _reset_frame_state(self):
+        """清掉上一轮残留的帧/框，避免新一轮开头闪到旧画面。"""
         self._last_boxes = []
         self._last_annotated = None
         with self._frame_lock:
             self._latest_frame = None
+            self._display_frame = None
 
-        self.start_btn.config(state="disabled")
-        self.stop_btn.config(state="normal")
-        if self.use_camera:
-            self.stats_label.config(text="正在扫描（摄像头实时模式）...", fg="#00ff88")
-        else:
-            self.stats_label.config(text="扫描本地图片中...", fg="#ffcc00")
-
+    def _begin_realtime(self, status_text):
+        """启动实时模式（摄像头/视频共用）：读帧线程 + 主线程 UI 泵。"""
+        self.running = True
+        self.should_speak = True
+        self._reset_frame_state()
+        self._set_buttons_running(True)
+        self.stats_label.config(text=status_text, fg=C_GREEN)
         self.detection_thread = threading.Thread(target=self.detection_loop, daemon=True)
         self.detection_thread.start()
-        if self.use_camera:          # 摄像头实时模式才需要主线程 UI 泵；静态图一次性显示不用
-            self._start_ui_pump()
+        self._start_ui_pump()
+
+    def detect_camera(self):
+        """摄像头检测：打开摄像头 → 实时双线程检测。"""
+        if self.running:
+            self.stop_detection()
+        if not self._check_ready():
+            return
+        cap = self._open_camera()
+        if cap is None:
+            messagebox.showwarning(
+                "未找到摄像头",
+                "没有检测到可用摄像头。\n请检查摄像头是否插好/被占用，"
+                "或改用「🎬 视频检测」「🖼 图片检测」。")
+            return
+        self.cap = cap
+        self.use_camera = True
+        self.is_video_file = False
+        self.static_frame = None
+        self._begin_realtime("正在检测（摄像头实时）…")
+
+    def detect_image(self):
+        """图片检测：选一张图片 → 检测一次。"""
+        if self.running:
+            self.stop_detection()
+        if not self._check_ready():
+            return
+        initial_dir = str(DATA_DIR / "samples")
+        if not os.path.isdir(initial_dir):
+            initial_dir = str(DATA_DIR)
+        file_path = filedialog.askopenfilename(
+            title="选择要检测的图片",
+            initialdir=initial_dir,
+            filetypes=[("图片文件", "*.jpg *.jpeg *.png *.bmp"), ("所有文件", "*.*")])
+        if not file_path:
+            return
+        try:
+            self.static_frame = imread_unicode(file_path)
+        except Exception:
+            self.static_frame = None
+        if self.static_frame is None:
+            messagebox.showerror("错误", f"无法读取图片：{file_path}")
+            return
+
+        self.use_camera = False
+        self.is_video_file = False
+        self.running = True
+        self.should_speak = True
+        self._reset_frame_state()
+        self._set_buttons_running(True)
+        self.stats_label.config(text="检测图片中…", fg=C_AMBER)
+        self.detection_thread = threading.Thread(target=self.detection_loop, daemon=True)
+        self.detection_thread.start()   # 静态图一次性显示，不需要 UI 泵
 
     def open_video(self):
         """选一个视频文件，按原生帧率播放并实时检测（复用摄像头双线程逻辑）。
@@ -479,13 +552,7 @@ class ToolDetectionApp:
         """
         if self.running:
             self.stop_detection()
-        if self.detector_engine is None:
-            messagebox.showwarning(
-                "检测器未就绪",
-                f"检测器未就绪，无法开始检测。\n\n详细错误：\n{self.model_error or '未知'}")
-            return
-        if not self._valid_tools():
-            messagebox.showwarning("警告", "没有任何可用工具，无法检测。")
+        if not self._check_ready():
             return
 
         initial_dir = str(DATA_DIR / "video")
@@ -512,21 +579,7 @@ class ToolDetectionApp:
         fps = cap.get(cv2.CAP_PROP_FPS)
         self.video_fps = fps if fps and fps > 1 else 25.0
 
-        self.running = True
-        self.should_speak = True
-        self._last_boxes = []
-        self._last_annotated = None
-        with self._frame_lock:
-            self._latest_frame = None
-
-        self.start_btn.config(state="disabled")
-        self.stop_btn.config(state="normal")
-        self.stats_label.config(
-            text=f"正在检测视频（{os.path.basename(file_path)}）...", fg="#00ff88")
-
-        self.detection_thread = threading.Thread(target=self.detection_loop, daemon=True)
-        self.detection_thread.start()
-        self._start_ui_pump()
+        self._begin_realtime(f"正在检测视频（{os.path.basename(file_path)}）…")
 
     def stop_detection(self):
         self.running = False
@@ -537,8 +590,7 @@ class ToolDetectionApp:
             self.cap.release()
             self.cap = None
 
-        self.start_btn.config(state="normal", text="▶ 立即检测")
-        self.stop_btn.config(state="disabled")
+        self._set_buttons_running(False)
         self.refresh_visible_list()
         self.stats_label.config(text="已停止", fg="#ff6b6b")
 
@@ -556,9 +608,9 @@ class ToolDetectionApp:
         self._last_annotated = None
         try:
             self.refresh_visible_list()
-            self.video_label.configure(image="", text="点击立即检测")
+            self.video_label.configure(image="", text="📷  点击下方按钮开始检测")
             self.video_label.imgtk = None
-            self.stats_label.config(text="已清空，待扫描", fg="#ffcc00")
+            self.stats_label.config(text="已清空，待检测", fg=C_MUTED)
         except Exception as e:
             print(f"清空显示出错: {e}")
 
@@ -710,8 +762,7 @@ class ToolDetectionApp:
         if self.cap is not None:
             self.cap.release()
             self.cap = None
-        self.start_btn.config(state="normal", text="▶ 立即检测")
-        self.stop_btn.config(state="disabled")
+        self._set_buttons_running(False)
         self.refresh_visible_list()
         self.stats_label.config(text="视频检测完毕", fg="#00ff88")
 
@@ -804,8 +855,7 @@ class ToolDetectionApp:
 
         self.running = False
         try:
-            self.start_btn.config(state="normal", text="▶ 立即检测")
-            self.stop_btn.config(state="disabled")
+            self._set_buttons_running(False)
             total = len(self._valid_tools())
             # 底部数字必须和上方列表一致——用 refresh 返回的 recognized_count，
             # 而不是本帧 len(detected)；连续多次点检测时窗口里旧条目仍算
