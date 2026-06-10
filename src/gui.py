@@ -585,6 +585,7 @@ class ToolDetectionApp:
         self.running = False
         self.should_speak = False
         self._infer_running = False   # 停掉后台推理线程
+        self.voice.stop()             # 立刻打断正在念的语音（不管念没念完）
 
         if self.cap is not None:
             self.cap.release()
