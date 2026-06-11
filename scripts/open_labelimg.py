@@ -14,9 +14,43 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-IMG_DIR = ROOT / "data" / "training" / "autolabel" / "images"
-LBL_DIR = ROOT / "data" / "training" / "autolabel" / "labels"
-CLASSES = ROOT / "data" / "training" / "autolabel" / "classes.txt"
+# 可选参数：要标注的子文件夹名（data/training/ 下），默认 autolabel。
+#   python scripts/open_labelimg.py            -> data/training/autolabel
+#   python scripts/open_labelimg.py relabel    -> data/training/relabel
+_SUB = sys.argv[1] if len(sys.argv) > 1 else "autolabel"
+BASE = ROOT / "data" / "training" / _SUB
+IMG_DIR = BASE / "images"
+LBL_DIR = BASE / "labels"
+CLASSES = BASE / "classes.txt"
+
+
+def ensure_yolo_format():
+    """把 labelImg 默认保存格式预设成 YOLO（写 ~/.labelImgSettings.pkl）。
+
+    labelImg 把"上次用的格式"存这个文件里，启动时读它。预设成 YOLO 后，
+    打开就是 YOLO，不用每次手动点左下角切格式（默认是 PascalVOC，会存成 .xml）。
+    """
+    try:
+        import pickle
+        from libs.labelFile import LabelFileFormat
+    except Exception as e:
+        print(f"(无法预设 YOLO 默认，需手动切左下角格式：{e})")
+        return
+    pkl = Path.home() / ".labelImgSettings.pkl"
+    data = {}
+    if pkl.is_file():
+        try:
+            with open(pkl, "rb") as f:
+                data = pickle.load(f)      # 尽量保留其它设置（窗口位置等）
+        except Exception:
+            data = {}
+    data["labelFileFormat"] = LabelFileFormat.YOLO
+    try:
+        with open(pkl, "wb") as f:
+            pickle.dump(data, f, pickle.HIGHEST_PROTOCOL)
+        print("✅ 已把 labelImg 默认格式设为 YOLO（打开即是，不用手动切）")
+    except Exception as e:
+        print(f"(写 labelImg 设置失败，需手动切 YOLO：{e})")
 
 
 def find_labelimg():
@@ -40,6 +74,8 @@ def main():
         print(f"⚠️  图片目录为空或不存在：{IMG_DIR}")
         print("    先把要标注的照片(.jpg)放进去再运行本脚本。")
         return
+
+    ensure_yolo_format()   # 预设默认格式 YOLO
 
     cmd = find_labelimg()
     if cmd is None:

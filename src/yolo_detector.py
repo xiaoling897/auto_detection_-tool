@@ -13,11 +13,11 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-CONFIDENCE_THRESHOLD = 0.55   # YOLO 置信度阈值（偏准确）。0.70 太严会漏检远处/小目标；
-                              # 0.40 太松会带进 47~50% 的垃圾框/误检。0.55 折中偏准：
-                              # 砍掉大部分低置信度误检，代价是极弱的真目标(如某些角度的钢丝钳)可能漏。
-                              # 注意：高置信度"张冠李戴"(如红色万用表被认成绝缘电阻测试仪)是模型混淆，
-                              # 调阈值无效，只能补训练照片重训。误检多就往上调、漏检多就往下调。
+CONFIDENCE_THRESHOLD = 0.55   # YOLO 置信度阈值（偏准确）。误检多往上调、漏检多往下调。
+                              # 注："静态画面识别不全"不是阈值问题（降到 0.45 也没改善）——
+                              # 是那几件工具在某个固定角度下模型置信度极低，要靠 TTA/补数据解决。
+TTA_ENABLED = False           # 测试时增强：多尺度+翻转推理提召回。实测对"某角度大物体漏检"无效（是数据问题），
+                              # 且慢 2-3 倍，故默认关。想要更高召回可改 True。
 IOU_THRESHOLD = 0.45          # NMS 阈值
 
 # Windows 中文字体路径（cv2.putText 不支持中文，得走 PIL）
@@ -112,12 +112,14 @@ class YoloToolDetector:
               - confidences: {tool_name: 置信度 0-100 整数}
               - boxes: [(x1, y1, x2, y2, cn_name, conf_pct), ...] 供 render 复用
         """
-        # 用默认推理尺寸（640）：416 虽快但小目标/远处工具像素不足会漏检。
-        # 速度问题靠"限制 torch 线程 + 检测线程冷却 + 双线程解耦"解决，不靠牺牲分辨率。
+        # augment=True 开 TTA（测试时增强）：对同一帧跑多尺度+翻转再合并，召回更高。
+        # 解决"静止画面某些工具(万用表/激光测距仪)分数差一点没过线、一动就出来"的问题——
+        # 相当于把"运动带来的多视角"在静态帧上补上。代价：单帧推理慢 2-3 倍（后台线程跑，不卡画面）。
         results = self.model(
             frame_bgr,
             conf=self.confidence_threshold,
             iou=IOU_THRESHOLD,
+            augment=TTA_ENABLED,
             verbose=False,
         )
         result = results[0]

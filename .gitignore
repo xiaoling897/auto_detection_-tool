@@ -27,6 +27,8 @@ dist/
 # 根目录的底座权重（yolov8n.pt / yolov8s-worldv2.pt 等，可重新下载）。
 # 部署模型在 data/yolo/best.pt，不在根目录，照常进 git，不受此规则影响。
 /*.pt
+# 模型备份（如 best_v1_backup.pt）：本地留着方便退回，不进 git（旧模型 git 历史里也有）
+*_backup.pt
 
 # 临时/系统
 *.log
