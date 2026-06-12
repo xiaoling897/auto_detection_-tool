@@ -18,7 +18,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TRAIN = ROOT / "data" / "training"
-SOURCES = [TRAIN / "relabel_done", TRAIN / "relabel", TRAIN / "relabel_check"]
+# 自动发现所有 relabel* 批次文件夹（relabel/relabel_done/relabel2/relabel3/...），
+# 新建批次无需再改这里。按名排序，dedup 取第一个，含标签的优先。
+SOURCES = sorted(p for p in TRAIN.glob("relabel*")
+                 if p.is_dir() and (p / "images").is_dir())
 OUT = TRAIN / "yolo_dataset"
 BG_DIR = TRAIN / "photo" / "背景图"
 SPLIT = (0.7, 0.2, 0.1)

@@ -12,11 +12,16 @@
 用法：  python scripts/archive_labeled.py
 """
 import shutil
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-BASE = ROOT / "data" / "training" / "relabel"
-DONE = ROOT / "data" / "training" / "relabel_done"
+# 可选参数：要归档的批次文件夹名（默认 relabel）。归档到 <名>_done。
+#   python scripts/archive_labeled.py            -> relabel  -> relabel_done
+#   python scripts/archive_labeled.py relabel3   -> relabel3 -> relabel3_done
+_SUB = sys.argv[1] if len(sys.argv) > 1 else "relabel"
+BASE = ROOT / "data" / "training" / _SUB
+DONE = ROOT / "data" / "training" / f"{_SUB}_done"
 IMG, LBL = BASE / "images", BASE / "labels"
 MARGIN = 60.0   # 标签比图片晚 >60s 视为"人工存过"
 IMG_EXT = (".jpg", ".jpeg", ".png", ".bmp")
