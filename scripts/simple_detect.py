@@ -38,16 +38,15 @@ class SimpleToolDetector:
             print(f"模板目录 {template_dir} 不存在")
             return
 
-        # 工具名称映射
+        # 工具名称映射（9 个，顺序与 data/yolo/class_map.json 一致）
         tool_names = [
-            "钢直尺", "螺丝刀", "绝缘钢丝钳", "数字万用表",
-            "绝缘测试仪", "网线测线仪", "激光测距仪",
-            "数显倾角仪", "电工胶带", "磁力线坠", "胎压测试仪"
+            "数字万用表", "激光测距仪", "绝缘钢丝钳", "磁力线坠",
+            "网线测线仪", "卷尺", "绝缘电阻测试仪", "胎压测试仪", "电工胶带"
         ]
 
         img_files = sorted([f for f in os.listdir(template_dir) if f.lower().endswith(('.jpg', '.png', '.jpeg'))])
 
-        for i, img_file in enumerate(img_files[:11]):  # 只取前11个
+        for i, img_file in enumerate(img_files[:9]):  # 只取前9个
             img_path = os.path.join(template_dir, img_file)
             img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
             if img is not None:
