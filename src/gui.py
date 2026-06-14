@@ -1,20 +1,17 @@
-"""Tkinter GUI：实时扫描模式（检测后端自动选择：有 data/yolo/best.pt 用 YOLO，否则 SIFT；3 秒滑动窗口防抖）
+"""Tkinter GUI：全屏视频 + 半透明悬浮 UI（圆角按钮 / 悬浮清单 / 顶栏）。
 
-工作流：
-  - 摄像头模式（双线程实时）：显示线程持续读帧 + 叠最近的框 + 显示，永远满帧率；
-    推理线程在后台跑 YOLO，只回写"最近的框 + 识别时间戳"。两线程不互相阻塞，
-    所以模型再重也只拖慢"框刷新率"，视频本身始终流畅。
-    避开旧双线程"饿死显示"的两个关键：① torch 限核（留 CPU 给显示线程，见
-    yolo_detector）；② 显示线程每帧只做 cv2 画框 + 缓存标签贴图（render_live），
-    绝不每帧整幅 PIL 渲染。
-  - 静态图模式：弹文件框选图 → 检测一次 → 立即刷新列表
-  - 右侧列表全量显示全部工具，识别中的（✓ 绿）排上面，未识别的（✗ 红）排下面
-  - 列表 UI 每 3 秒刷新一次（不实时刷新，避免闪烁）；可见性窗口 3 秒
-  - 每 8 秒播报一次当前缺失的工具
-  - "🔄 清空显示"先停检测再清空 last_seen
+显示模型（2026-06 改版）：
+  整个窗口是一张全屏视频（铺满裁切）。底部圆角按钮、右侧工具清单、顶部信息条
+  都用 PIL 半透明"画"进每一帧里，透出底下画面、不挡视频。Tkinter 原生控件做不到
+  真透明（背景是不透明色块），所以走 PIL 合成这条路。
+  - 按钮可点：画布坐标命中检测（_on_click / _on_motion）触发命令 + 悬停高亮。
+  - 不卡的关键：顶栏/清单/按钮都做成"缓存贴图（RGBA sprite）"，只在内容变化时重绘；
+    每帧只把缓存贴图 alpha 混合到画面的小块区域（numpy，便宜），绝不每帧整幅 PIL 渲染。
 
-依赖 data/smart_tools.json 里的工具配置 + data/smart_templates/ 下的模板图。
+检测后端 / 双线程实时逻辑与之前一致（显示线程读帧+叠框，推理线程后台跑 YOLO，
+主线程 _ui_pump 取帧画图）。详见各方法注释。
 """
+import math
 import os
 import threading
 import time
@@ -22,7 +19,8 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 
 import cv2
-from PIL import Image, ImageTk
+import numpy as np
+from PIL import Image, ImageTk, ImageDraw, ImageFont
 
 from .detector import ToolDetector
 from .loader import load_tools, load_tool_names
@@ -32,23 +30,17 @@ from .voice import VoiceReporter
 UI_REFRESH_INTERVAL = 3.0   # 列表 UI 刷新节奏
 DETECT_INTERVAL = 0.4       # 检测限频：每 N 秒推理一次（其余时间只读帧+叠最近的框，保证视频顺）
 VISIBILITY_WINDOW = 5.0     # 工具可见性窗口（去抖）：最近 N 秒内识别到就算"在"。
-                            # 设大一点能吸收"检测抖动 + 伸手遮挡"导致的瞬时漏检，
-                            # 避免拿走一个工具时把旁边被手挡住的工具误报成缺失。
-                            # 太小→误报缺失；太大→真拿走后要等更久才报。同时影响列表/框/语音。
 SPEAK_INTERVAL = 8.0        # 语音播报间隔
 
-# ---- 配色（统一暗色主题，集中放这里方便整体换肤）----
-C_BG = "#0f1629"            # 窗口主背景（深海军蓝）
-C_PANEL = "#16213e"         # 面板背景
-C_CARD = "#1d2b4a"          # 卡片/工具行背景（比面板亮一点）
-C_VIDEO = "#0a0e1a"         # 视频区背景
-C_BORDER = "#2a3a5c"        # 描边
+# ---- 配色（统一暗色主题）----
+C_BG = "#0f1629"            # 窗口主背景（深海军蓝）—— 无画面时的底
 C_ACCENT = "#38bdf8"        # 主题强调色（青）
 C_TEXT = "#e6edf3"          # 主文字
 C_MUTED = "#7d8aa0"         # 次要/未识别文字
 C_GREEN = "#22c55e"         # 识别成功
 C_AMBER = "#f59e0b"         # 中等置信度
-FONT = "Microsoft YaHei UI"
+C_RED = "#ef4444"           # 未识别
+FONT_PATH = "C:/Windows/Fonts/msyh.ttc"   # 微软雅黑（中文）
 
 # 按钮配色 (常态, 悬停)
 BTN_CAM = ("#16a34a", "#22c55e")
@@ -57,8 +49,19 @@ BTN_IMAGE = ("#0891b2", "#06b6d4")
 BTN_STOP = ("#dc2626", "#ef4444")
 BTN_RESET = ("#475569", "#64748b")
 
-# 诊断日志：写到 exe 同级 data/run_diag.txt（windowed 包没控制台也能留痕），同时打印。
-# 排查"卡 + 识别不出"用——记录后端、单次推理耗时、检测速率、显示帧率、读帧耗时。
+# ---- 悬浮层尺寸 ----
+TOPBAR_H = 76               # 顶部文字区高度（无背景条，仅占位排版）
+TITLE_SPACING = 16          # 标题字间距
+TITLE_SIZE = 32             # 顶部标题字号
+HINT_SIZE = 22              # 中间提示字号（须小于标题）
+PANEL_W = 372              # 右侧悬浮清单宽度
+WIN_W, WIN_H = 2184, 1300  # 启动窗口尺寸
+STRIP_H = 138              # 底部按钮条高度
+PILL_H = 70                # 圆角按钮高度
+PILL_PAD = 54             # 按钮文字左右内边距（越大按钮越长）
+PILL_GAP = 18             # 按钮间距
+MARGIN = 22               # 边距
+
 DIAG_PATH = DATA_DIR / "run_diag.txt"
 
 
@@ -72,12 +75,20 @@ def diag(msg):
         pass
 
 
+def _hex2rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
 class ToolDetectionApp:
     def __init__(self, root):
         self.root = root
         self.root.title("智能工具检测系统")
-        self.root.geometry("1480x920")
-        self.root.minsize(1200, 760)
+        # 启动时在屏幕中央显示
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        px, py = max(0, (sw - WIN_W) // 2), max(0, (sh - WIN_H) // 2)
+        self.root.geometry(f"{WIN_W}x{WIN_H}+{px}+{py}")
+        self.root.minsize(1100, 680)
         self.root.configure(bg=C_BG)
 
         self.voice = VoiceReporter()
@@ -92,7 +103,6 @@ class ToolDetectionApp:
                 from .yolo_detector import YoloToolDetector
                 class_map = DATA_DIR / "yolo" / "class_map.json"
                 self.detector_engine = YoloToolDetector(str(yolo_model), str(class_map))
-                # YOLO 模式下工具清单来自 class_map（中文名），不需要模板特征
                 self.tools = [{"name": n} for n in load_tool_names()]
                 print(f"✅ YOLO 模式：{yolo_model}，{len(self.tools)} 个工具")
             else:
@@ -100,7 +110,6 @@ class ToolDetectionApp:
                 self.detector_engine = ToolDetector(self.tools)
                 print(f"✅ SIFT 模式：{len(self.tools)} 个工具模板")
         except Exception as e:
-            # YOLO 失败时回退 SIFT，让程序仍能跑
             self.model_error = f"{'YOLO' if self.use_yolo else 'SIFT'} 加载失败: {e}"
             print(self.model_error)
             try:
@@ -117,33 +126,56 @@ class ToolDetectionApp:
         # 运行状态
         self.cap = None
         self.use_camera = False
-        self.is_video_file = False   # True=播放视频文件（需按原生帧率播放、放完自动停）
+        self.is_video_file = False
         self.video_fps = 0.0
         self.static_frame = None
         self.running = False
         self.should_speak = False
-        self.last_seen = {}      # 工具名 -> 上次识别到的时间戳
-        self.last_counts = {}    # 工具名 -> 上一帧 RANSAC 内点数
-        self.last_source = {}    # 工具名 -> 上一帧命中来源（"强"/"弱"/"色"）
-        self.detect_threshold = 10   # 上一帧有效阈值（自适应，诊断显示用）
+        self.last_seen = {}
+        self.last_counts = {}
+        self.last_source = {}
+        self.detect_threshold = 10
 
-        # 双线程实时：显示线程(读帧+叠框+显示) 与 推理线程(后台跑 YOLO) 解耦。
-        # 重模型(如 yolo11s)单帧推理几十~几百 ms，若和显示同线程会每隔 DETECT_INTERVAL
-        # 就把画面冻住几百 ms → 卡顿。拆开后推理只在后台更新"最近的框"，显示线程不等推理，
-        # 视频始终满帧率；模型重只表现为框刷新率低一点（固定监控场景工具不动，无感）。
-        self._last_boxes = []            # 显示线程每帧叠到实时画面的框（经"存活期"平滑，防闪）
-        self._box_store = {}             # 工具名 -> (框, 时间戳)：框防闪用，见 _hold_boxes
-        self._last_annotated = None      # 最近一次 SIFT 标注帧（SIFT 回退用）
-        self._latest_frame = None        # 读帧线程读到的最新原始帧，供推理线程取用（共享）
-        self._display_frame = None       # 叠好框的"待显示帧"，由主线程 _ui_pump 取去画（共享）
-        self._display_id = 0             # 待显示帧的版本号，主线程据此判断是否有新帧
+        # 双线程实时
+        self._last_boxes = []
+        self._box_store = {}
+        self._last_annotated = None
+        self._latest_frame = None
+        self._display_frame = None
+        self._display_id = 0
         self._frame_lock = threading.Lock()
-        self._infer_running = False      # 推理线程开关
-        # 主线程 UI 泵的状态
+        self._infer_running = False
         self._last_shown_id = -1
         self._last_recog = None
         self._last_ui_refresh = 0.0
         self._last_speak = 0.0
+
+        # ---- 悬浮层状态 ----
+        self._cw = self._ch = 0          # 当前显示区像素尺寸
+        self._cur_base = None            # 最近一帧底图（BGR）或 None（空闲暗底）
+        self._font_cache = {}
+        self._backend_label = "YOLO 深度学习" if self.use_yolo else "SIFT 模板匹配"
+        self._status_text = "点击下方按钮开始检测"
+        self._status_color = C_MUTED
+        # 工具视图：[(name, recog, count)]；识别优先排序
+        self._tool_view = [(t["name"], False, 0) for t in self.tools]
+        self._recog_count = 0
+        # 按钮表（顺序即从左排列；group L 左、R 右）
+        self._buttons = [
+            {"key": "cam",   "text": "摄像头",  "colors": BTN_CAM,   "command": self.detect_camera, "group": "L", "enabled": True},
+            {"key": "video", "text": "视频",    "colors": BTN_VIDEO, "command": self.open_video,    "group": "L", "enabled": True},
+            {"key": "image", "text": "图片",    "colors": BTN_IMAGE, "command": self.detect_image,  "group": "L", "enabled": True},
+            {"key": "stop",  "text": "停止",    "colors": BTN_STOP,  "command": self.stop_detection,"group": "R", "enabled": False},
+            {"key": "clear", "text": "清空",    "colors": BTN_RESET, "command": self.reset_display, "group": "R", "enabled": True},
+        ]
+        for b in self._buttons:
+            b["rect"] = None
+        self._hover_key = None
+        self._show_panel = False         # 右侧清单只在检测时显示（开始检测前/清空后隐藏）
+        # 贴图缓存 + 签名
+        self._sp_topbar = self._sp_panel = self._sp_buttons = None
+        self._sig_topbar = self._sig_panel = self._sig_buttons = None
+        self._panel_xy = (0, 0)
 
         diag("=" * 50)
         diag(f"启动诊断：后端={'YOLO' if self.use_yolo else 'SIFT(回退)'}, "
@@ -152,213 +184,292 @@ class ToolDetectionApp:
 
         self.create_ui()
 
-    # ---------------- UI ----------------
-
-    def _make_button(self, parent, text, colors, command, state="normal"):
-        """扁平现代风按钮 + 悬停高亮。colors=(常态色, 悬停色)。"""
-        base, hover = colors
-        btn = tk.Button(parent, text=text, command=command, state=state,
-                        font=(FONT, 13, "bold"), bg=base, fg="white",
-                        activebackground=hover, activeforeground="white",
-                        disabledforeground="#9aa6bd",
-                        relief="flat", bd=0, cursor="hand2", padx=16, pady=11)
-        btn._base, btn._hover = base, hover
-        btn.bind("<Enter>",
-                 lambda e: btn.config(bg=hover) if str(btn["state"]) == "normal" else None)
-        btn.bind("<Leave>",
-                 lambda e: btn.config(bg=base) if str(btn["state"]) == "normal" else None)
-        return btn
-
-    def _set_buttons_running(self, running):
-        """运行中：禁用三个检测按钮、启用停止；停止时反之。顺带复位悬停残留色。"""
-        for b in (self.cam_btn, self.video_btn, self.image_btn):
-            b.config(state="disabled" if running else "normal", bg=b._base)
-        self.stop_btn.config(state="normal" if running else "disabled",
-                             bg=self.stop_btn._base)
+    # ---------------- UI 搭建 ----------------
 
     def create_ui(self):
-        main = tk.Frame(self.root, bg=C_BG)
-        main.pack(fill="both", expand=True)
+        # 全屏视频底板：一张铺满窗口的 Label，悬浮 UI 都画进它显示的图里
+        self.video_label = tk.Label(self.root, bg=C_BG, bd=0)
+        self.video_label.place(x=0, y=0, relwidth=1, relheight=1)
+        self.video_label.bind("<Configure>", self._on_resize)
+        self.video_label.bind("<Button-1>", self._on_click)
+        self.video_label.bind("<Motion>", self._on_motion)
+        # 初次绘制（等尺寸 realize 后）
+        self.root.after(60, self._recompose_idle)
 
-        # ---- 顶部标题栏 ----
-        header = tk.Frame(main, bg=C_BG)
-        header.pack(fill="x", padx=22, pady=(16, 6))
-        tk.Label(header, text="🔧 智能工具检测系统", font=(FONT, 24, "bold"),
-                 bg=C_BG, fg=C_ACCENT).pack(side="left")
-        badge_bg = "#14532d" if self.use_yolo else "#5b3a13"
-        badge_fg = C_GREEN if self.use_yolo else C_AMBER
-        self.backend_badge = tk.Label(
-            header, text=f"  {'YOLO 深度学习' if self.use_yolo else 'SIFT 模板匹配'}  ",
-            font=(FONT, 10, "bold"), bg=badge_bg, fg=badge_fg, padx=4, pady=3)
-        self.backend_badge.pack(side="right", pady=6)
+    def _font(self, size, bold=False):
+        key = (size, bold)
+        f = self._font_cache.get(key)
+        if f is None:
+            try:
+                # msyh.ttc：0=Regular 1=Bold
+                f = ImageFont.truetype(FONT_PATH, size, index=1 if bold else 0)
+            except Exception:
+                f = ImageFont.load_default()
+            self._font_cache[key] = f
+        return f
 
-        # ---- 主体：左视频 + 右列表 ----
-        body = tk.Frame(main, bg=C_BG)
-        body.pack(fill="both", expand=True, padx=22, pady=(0, 16))
+    @staticmethod
+    def _text_wh(font, text):
+        l, t, r, b = font.getbbox(text)
+        return r - l, b - t
 
-        left = tk.Frame(body, bg=C_BG)
-        left.pack(side="left", fill="both", expand=True)
+    # ---------------- 贴图（sprite）构建 ----------------
 
-        # 视频卡片（细描边）
-        video_card = tk.Frame(left, bg=C_VIDEO, highlightbackground=C_BORDER,
-                              highlightthickness=1, bd=0)
-        video_card.pack(fill="both", expand=True)
-        self.video_label = tk.Label(video_card, bg=C_VIDEO, fg=C_MUTED,
-                                    text="📷  点击下方按钮开始检测",
-                                    font=(FONT, 15))
-        self.video_label.pack(fill="both", expand=True, padx=6, pady=6)
+    def _make_topbar(self, w):
+        """顶部仅展示标题「智能工具检测系统」，水平居中、字间距拉开。
+        无背景条——文字直接透明浮在画面上，描边阴影保证亮背景下也看得清。"""
+        im = Image.new("RGBA", (w, TOPBAR_H), (0, 0, 0, 0))
+        d = ImageDraw.Draw(im)
+        f = self._font(TITLE_SIZE, bold=True)
+        title = "智能工具检测系统"
+        widths = [self._text_wh(f, ch)[0] for ch in title]
+        total_w = sum(widths) + TITLE_SPACING * (len(title) - 1)
+        th = self._text_wh(f, title)[1]
+        x = (w - total_w) // 2
+        y = (TOPBAR_H - th) // 2 - 1
+        for ch, cw in zip(title, widths):
+            # 厚黑描边 + 纯白字，亮/暗背景下都清晰
+            for dx in (-2, -1, 0, 1, 2):
+                for dy in (-2, -1, 0, 1, 2):
+                    if dx or dy:
+                        d.text((x + dx, y + dy), ch, font=f, fill=(0, 0, 0, 210))
+            d.text((x, y), ch, font=f, fill=(255, 255, 255))
+            x += cw + TITLE_SPACING
+        return np.array(im)
 
-        # ---- 按钮栏 ----
-        bar = tk.Frame(left, bg=C_BG)
-        bar.pack(fill="x", pady=(14, 0))
-        self.cam_btn = self._make_button(bar, "📷 摄像头检测", BTN_CAM, self.detect_camera)
-        self.cam_btn.pack(side="left")
-        self.video_btn = self._make_button(bar, "🎬 视频检测", BTN_VIDEO, self.open_video)
-        self.video_btn.pack(side="left", padx=10)
-        self.image_btn = self._make_button(bar, "🖼 图片检测", BTN_IMAGE, self.detect_image)
-        self.image_btn.pack(side="left")
-        # 弹簧：把"停止/清空"推到右边
-        tk.Frame(bar, bg=C_BG).pack(side="left", expand=True, fill="x")
-        self.stop_btn = self._make_button(bar, "⏹ 停止检测", BTN_STOP,
-                                          self.stop_detection, state="disabled")
-        self.stop_btn.pack(side="left", padx=(0, 10))
-        self.reset_btn = self._make_button(bar, "🗑 清空显示", BTN_RESET, self.reset_display)
-        self.reset_btn.pack(side="left")
+    def _make_panel(self):
+        """右侧悬浮清单：半透明方角面板，识别在上、未识别在下。"""
+        rows = self._tool_view
+        head_h = 56
+        row_h = 48
+        ph = head_h + len(rows) * row_h + 16
+        im = Image.new("RGBA", (PANEL_W, ph), (0, 0, 0, 0))
+        d = ImageDraw.Draw(im)
+        # 更透明、方角（无圆角）
+        d.rectangle([0, 0, PANEL_W - 1, ph - 1], fill=(22, 33, 62, 110))
+        fh = self._font(18, bold=True)
+        d.text((18, 16), "已识别工具", font=fh, fill=_hex2rgb(C_TEXT))
+        # 右侧：进度 / 总数（如 6/9）
+        total = len(self._valid_tools())
+        prog = f"{self._recog_count}/{total}"
+        fbd = self._font(18, bold=True)
+        pw = self._text_wh(fbd, prog)[0]
+        d.text((PANEL_W - 18 - pw, 16), prog, font=fbd,
+               fill=_hex2rgb(C_GREEN if self._recog_count else C_MUTED))
+        fn = self._font(16, bold=True)
+        fc = self._font(14, bold=True)
+        y = head_h
+        for name, recog, count in rows:
+            # 状态点：识别=绿实心圆，未识别=红空心圈（画图形，不依赖字体字形，避免豆腐块）
+            cy = y + row_h // 2
+            cx, r = 26, 6
+            if recog:
+                d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=_hex2rgb(C_GREEN))
+            else:
+                d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=_hex2rgb(C_RED), width=2)
+            d.text((48, y + row_h // 2 - 12), name, font=fn,
+                   fill=_hex2rgb(C_TEXT if recog else C_MUTED))
+            if self.use_yolo and recog and count > 0:
+                cc = C_GREEN if count >= 70 else C_AMBER if count >= 50 else C_MUTED
+                txt = f"{count}%"
+            else:
+                cc = "#4a5670"
+                txt = "--"
+            tw = self._text_wh(fc, txt)[0]
+            d.text((PANEL_W - 18 - tw, y + row_h // 2 - 10), txt, font=fc, fill=_hex2rgb(cc))
+            y += row_h
+        return np.array(im)
 
-        # ---- 右侧工具清单 ----
-        right = tk.Frame(body, bg=C_PANEL, width=360)
-        right.pack(side="right", fill="y", padx=(18, 0))
-        right.pack_propagate(False)
+    def _make_buttons(self, w, h):
+        """底部圆角半透明按钮条：五个按钮整体居中排成一排。
+        同时把每个按钮的绝对矩形写回 b['rect'] 供点击命中。"""
+        im = Image.new("RGBA", (w, STRIP_H), (0, 0, 0, 0))
+        d = ImageDraw.Draw(im)
+        f = self._font(22, bold=True)
+        ly = (STRIP_H - PILL_H) // 2
+        abs_y = h - STRIP_H + ly
 
-        rhead = tk.Frame(right, bg=C_PANEL)
-        rhead.pack(fill="x", padx=18, pady=(18, 8))
-        tk.Label(rhead, text="📋 已识别工具", font=(FONT, 15, "bold"),
-                 bg=C_PANEL, fg=C_TEXT).pack(side="left")
-        self.count_badge = tk.Label(rhead, text="0/0", font=(FONT, 12, "bold"),
-                                    bg=C_CARD, fg=C_GREEN, padx=10, pady=2)
-        self.count_badge.pack(side="right")
+        # 先量出每个按钮宽度，算总宽以便居中
+        widths = [self._text_wh(f, b["text"])[0] + 2 * PILL_PAD for b in self._buttons]
+        total = sum(widths) + PILL_GAP * (len(self._buttons) - 1)
+        x = (w - total) // 2
 
-        self.tool_status_frame = tk.Frame(right, bg=C_PANEL)
-        self.tool_status_frame.pack(fill="both", expand=True, padx=12, pady=4)
+        for b, bw in zip(self._buttons, widths):
+            base, hover = b["colors"]
+            if not b["enabled"]:
+                rgb, a, tcol = _hex2rgb(base), 90, (154, 166, 189)
+            elif self._hover_key == b["key"]:
+                rgb, a, tcol = _hex2rgb(hover), 235, (255, 255, 255)
+            else:
+                rgb, a, tcol = _hex2rgb(base), 205, (255, 255, 255)
+            d.rounded_rectangle([x, ly, x + bw, ly + PILL_H], radius=PILL_H // 2,
+                                fill=(*rgb, a))
+            th = self._text_wh(f, b["text"])[1]
+            d.text((x + PILL_PAD, ly + (PILL_H - th) // 2 - 2), b["text"], font=f, fill=tcol)
+            b["rect"] = (x, abs_y, bw, PILL_H)
+            x += bw + PILL_GAP
+        return np.array(im)
 
-        self.build_tool_rows()
+    def _ensure_sprites(self):
+        """按签名惰性重建三块贴图；尺寸/状态没变就复用缓存。"""
+        w, h = self._cw, self._ch
+        sig_t = (w,)   # 顶部只剩居中标题，只随宽度变化
+        if sig_t != self._sig_topbar:
+            self._sp_topbar = self._make_topbar(w)
+            self._sig_topbar = sig_t
 
-        self.stats_label = tk.Label(right, text="待检测…", font=(FONT, 11),
-                                    bg=C_PANEL, fg=C_MUTED)
-        self.stats_label.pack(pady=(6, 16))
+        sig_p = (tuple(self._tool_view), self._recog_count, self.use_yolo)
+        if sig_p != self._sig_panel:
+            self._sp_panel = self._make_panel()
+            self._sig_panel = sig_p
+        self._panel_xy = (w - PANEL_W - MARGIN, MARGIN)   # 贴右上角
 
-        # 初始状态：所有工具显示为未识别——必须放在 stats_label 创建之后
-        self.refresh_visible_list()
+        sig_b = (w, h, self._hover_key, tuple(b["enabled"] for b in self._buttons))
+        if sig_b != self._sig_buttons:
+            self._sp_buttons = self._make_buttons(w, h)
+            self._sig_buttons = sig_b
 
-    def build_tool_rows(self):
-        """为每个工具预创建一张"卡片行"。refresh_visible_list 决定 pack 顺序 + 状态颜色。"""
-        for tool in self.tools:
-            name = tool["name"]
-            row = tk.Frame(self.tool_status_frame, bg=C_CARD)
+    # ---------------- 合成 + 显示 ----------------
 
-            # 左侧状态色条
-            accent = tk.Frame(row, bg="#ef4444", width=4)
-            accent.pack(side="left", fill="y")
+    @staticmethod
+    def _cover_resize(frame_bgr, w, h):
+        """铺满裁切：等比放大到盖住 w×h，居中裁掉溢出。返回 BGR(w×h)。"""
+        fh, fw = frame_bgr.shape[:2]
+        scale = max(w / fw, h / fh)
+        nw, nh = max(w, int(math.ceil(fw * scale))), max(h, int(math.ceil(fh * scale)))
+        resized = cv2.resize(frame_bgr, (nw, nh))
+        x0, y0 = (nw - w) // 2, (nh - h) // 2
+        return resized[y0:y0 + h, x0:x0 + w]
 
-            inner = tk.Frame(row, bg=C_CARD)
-            inner.pack(side="left", fill="both", expand=True, padx=(10, 10), pady=9)
+    @staticmethod
+    def _blend(dst_rgb, sp_rgba, x, y):
+        """把 RGBA 贴图 alpha 混合到 dst_rgb 的 (x,y)。仅作用于重叠子块，便宜。"""
+        H, W = sp_rgba.shape[:2]
+        dh, dw = dst_rgb.shape[:2]
+        x0, y0 = max(x, 0), max(y, 0)
+        x1, y1 = min(x + W, dw), min(y + H, dh)
+        if x1 <= x0 or y1 <= y0:
+            return
+        sp = sp_rgba[y0 - y:y1 - y, x0 - x:x1 - x]
+        a = sp[..., 3:4].astype(np.float32) / 255.0
+        reg = dst_rgb[y0:y1, x0:x1].astype(np.float32)
+        dst_rgb[y0:y1, x0:x1] = (reg * (1 - a) + sp[..., :3].astype(np.float32) * a).astype(np.uint8)
 
-            status_indicator = tk.Label(inner, text="✗", font=("Segoe UI Emoji", 13),
-                                        bg=C_CARD, fg="#ef4444", width=2)
-            status_indicator.pack(side="left")
+    def _compose(self, base_bgr):
+        """组装当前显示图 = 底图(视频帧或暗底) + 顶栏/清单/按钮，画到 video_label。"""
+        w, h = self._cw, self._ch
+        if w < 40 or h < 40:
+            return
+        if base_bgr is None:
+            rgb = np.empty((h, w, 3), np.uint8)
+            rgb[:] = _hex2rgb(C_BG)
+        else:
+            rgb = cv2.cvtColor(self._cover_resize(base_bgr, w, h), cv2.COLOR_BGR2RGB)
 
-            name_label = tk.Label(inner, text=name, font=(FONT, 11, "bold"),
-                                  bg=C_CARD, fg=C_MUTED, anchor="w")
-            name_label.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        self._ensure_sprites()
+        self._blend(rgb, self._sp_topbar, 0, 0)
+        if self._show_panel and self._sp_panel is not None:
+            self._blend(rgb, self._sp_panel, self._panel_xy[0], self._panel_xy[1])
+        self._blend(rgb, self._sp_buttons, 0, h - STRIP_H)
 
-            match_label = tk.Label(inner, text="--", font=(FONT, 10, "bold"),
-                                   bg=C_CARD, fg=C_MUTED, width=8, anchor="e")
-            match_label.pack(side="right")
+        img = Image.fromarray(rgb)
+        if base_bgr is None:
+            # 空闲：中间提示
+            d = ImageDraw.Draw(img)
+            hint = "点击下方  摄像头 / 视频 / 图片  开始检测"
+            f = self._font(HINT_SIZE)
+            tw, th = self._text_wh(f, hint)
+            d.text(((w - tw) // 2, (h - th) // 2), hint, font=f, fill=_hex2rgb(C_MUTED))
 
-            tool["row"] = row
-            tool["accent"] = accent
-            tool["name_label"] = name_label
-            tool["status_label"] = status_indicator
-            tool["match_label"] = match_label
+        imgtk = ImageTk.PhotoImage(img)
+        self.video_label.imgtk = imgtk
+        self.video_label.configure(image=imgtk, text="")
+
+    def _recompose_idle(self):
+        """非运行态（空闲/停止/静态图）重绘一次。运行态由 _ui_pump 逐帧画，不用调这。"""
+        self._cw = self.video_label.winfo_width()
+        self._ch = self.video_label.winfo_height()
+        self._compose(self._cur_base)
+
+    def _show_frame(self, frame_bgr):
+        """运行态每帧调用：记下底图并合成显示。"""
+        self._cur_base = frame_bgr
+        self._cw = self.video_label.winfo_width()
+        self._ch = self.video_label.winfo_height()
+        self._compose(frame_bgr)
+
+    # ---------------- 交互（resize / 点击 / 悬停）----------------
+
+    def _on_resize(self, event):
+        if (event.width, event.height) != (self._cw, self._ch):
+            self._cw, self._ch = event.width, event.height
+            if not self.running:
+                self._recompose_idle()
+
+    def _on_click(self, event):
+        for b in self._buttons:
+            if not b["enabled"] or not b["rect"]:
+                continue
+            x, y, bw, bh = b["rect"]
+            if x <= event.x <= x + bw and y <= event.y <= y + bh:
+                b["command"]()
+                return
+
+    def _on_motion(self, event):
+        hit = None
+        for b in self._buttons:
+            if not b["enabled"] or not b["rect"]:
+                continue
+            x, y, bw, bh = b["rect"]
+            if x <= event.x <= x + bw and y <= event.y <= y + bh:
+                hit = b["key"]
+                break
+        if hit != self._hover_key:
+            self._hover_key = hit
+            self.video_label.configure(cursor="hand2" if hit else "")
+            if not self.running:
+                self._recompose_idle()
+
+    def set_status(self, text, color=C_MUTED):
+        self._status_text = text
+        self._status_color = color
+        if not self.running:
+            self._recompose_idle()
+
+    def _set_buttons_running(self, running):
+        for b in self._buttons:
+            if b["key"] in ("cam", "video", "image"):
+                b["enabled"] = not running
+            elif b["key"] == "stop":
+                b["enabled"] = running
+            # clear 始终可用
+        if not running:
+            self._hover_key = None
+        if not self.running:
+            self._recompose_idle()
 
     def refresh_visible_list(self):
-        """全部工具都显示：识别到的（✓ 绿）排上面，未识别的（✗ 红）排下面。
-
-        识别判定：last_seen 在最近 VISIBILITY_WINDOW 秒内。
-        每次刷新都 forget 所有行再按"识别优先"顺序重新 pack——保证排序稳定。
-        """
+        """重算工具视图（识别优先排序）→ 更新贴图数据。返回识别数。"""
         try:
             now = time.time()
+            recognized, unrecognized = [], []
             for tool in self.tools:
-                row = tool.get("row")
-                if row is not None:
-                    row.pack_forget()
-
-            recognized = []
-            unrecognized = []
-            for tool in self.tools:
-                if tool.get("row") is None:
-                    continue
                 name = tool["name"]
                 if now - self.last_seen.get(name, 0.0) < VISIBILITY_WINDOW:
-                    recognized.append(tool)
+                    recognized.append(name)
                 else:
-                    unrecognized.append(tool)
+                    unrecognized.append(name)
 
-            for tool in recognized + unrecognized:
-                row = tool["row"]
-                name = tool["name"]
-                row.pack(fill="x", pady=3)
+            view = []
+            for name in recognized:
+                view.append((name, True, int(self.last_counts.get(name, 0))))
+            for name in unrecognized:
+                view.append((name, False, int(self.last_counts.get(name, 0))))
+            self._tool_view = view
+            self._recog_count = len(recognized)
 
-                is_recog = tool in recognized
-                status_label = tool.get("status_label")
-                match_label = tool.get("match_label")
-                name_label = tool.get("name_label")
-                accent = tool.get("accent")
-
-                if status_label is not None:
-                    status_label.config(text="✓" if is_recog else "✗",
-                                        fg=C_GREEN if is_recog else "#ef4444")
-                if accent is not None:
-                    accent.config(bg=C_GREEN if is_recog else "#3a4763")
-                if name_label is not None:
-                    name_label.config(fg=C_TEXT if is_recog else C_MUTED)
-
-                if match_label is not None:
-                    count = self.last_counts.get(name, 0)
-                    if self.use_yolo:
-                        # YOLO 模式：count 是置信度百分比
-                        if is_recog and count > 0:
-                            fg = (C_GREEN if count >= 70 else
-                                  C_AMBER if count >= 50 else C_MUTED)
-                            match_label.config(text=f"{count}%", fg=fg)
-                        else:
-                            match_label.config(text="--", fg="#4a5670")
-                    else:
-                        # SIFT 模式：count=内点数, thr=阈值, src=命中来源(强/弱/色)
-                        thr = self.detect_threshold
-                        src = self.last_source.get(name, "")
-                        if is_recog:
-                            if src == "色":
-                                match_label.config(text=f"色 {count}", fg="#38bdf8")
-                            elif src == "弱":
-                                match_label.config(text=f"{count}/{thr}弱", fg=C_AMBER)
-                            elif src == "强":
-                                match_label.config(text=f"{count}/{thr}强", fg=C_GREEN)
-                            else:
-                                match_label.config(text=f"{count}/{thr}窗", fg=C_MUTED)
-                        else:
-                            match_label.config(
-                                text=f"{count}/{thr}" if count > 0 else "--",
-                                fg="#4a5670")
-
-            total = len(self._valid_tools())
-            self.count_badge.config(
-                text=f"{len(recognized)}/{total}",
-                fg=C_GREEN if recognized else C_MUTED)
-            self.stats_label.config(
-                text=f"当前识别 {len(recognized)} / {total} 个工具",
-                fg=C_TEXT)
+            if not self.running:
+                self._recompose_idle()
             return len(recognized)
         except Exception as e:
             print(f"刷新列表出错: {e}")
@@ -367,78 +478,45 @@ class ToolDetectionApp:
     # ---------------- 启停控制 ----------------
 
     def _valid_tools(self):
-        """可用于检测/统计的工具：YOLO 模式全部有效；SIFT 模式需有模板特征(des)"""
         if self.use_yolo:
             return list(self.tools)
         return [t for t in self.tools if t.get("des") is not None]
 
-    # 打开摄像头的尝试矩阵：按顺序逐个试，第一个出真画面的就用。
-    # 排序原则：旧 USB 摄像头惯用的「DSHOW + 强设 720p + 不改格式」放最前，保证老设备零回退；
-    # 后面几项专为 4K UVC 直播摄像机（如海康 DS-UVC-U168R）兜底——
-    #   · 加 MJPG：4K/USB 机常常只有压缩流才出画面，不设就给原始大帧或干脆不出流；
-    #   · 换 MSMF 后端：DSHOW 对现代 4K UVC 经常打不开或卡 4K 大帧，MSMF 往往更稳；
-    #   · 放开分辨率（native=用摄像头默认值）：有些 4K 机拒绝被设成 720p，只好接受其原生分辨率。
-    # (backend, 后端名, 是否强设720p, 是否设MJPG)
     _CAM_ATTEMPTS = [
         (cv2.CAP_DSHOW, "DSHOW", True,  False),
         (cv2.CAP_DSHOW, "DSHOW", True,  True),
         (cv2.CAP_MSMF,  "MSMF",  True,  False),
         (cv2.CAP_MSMF,  "MSMF",  True,  True),
-        (cv2.CAP_MSMF,  "MSMF",  False, False),  # native 分辨率兜底
+        (cv2.CAP_MSMF,  "MSMF",  False, False),
         (cv2.CAP_DSHOW, "DSHOW", False, False),
     ]
 
     def _try_open(self, index, flag, force_720p, use_mjpg, warmup_frames):
-        """按指定后端/分辨率/格式打开一次，预热读帧判断是否有真画面。
-
-        返回 (cap 或 None, opened)：
-          - cap 非 None  → 出了真画面，已配好，可直接用；
-          - cap 为 None 且 opened=True  → 设备能打开但没出可用画面（黑/灰屏或出流失败）；
-          - cap 为 None 且 opened=False → 这个设备号/后端根本打不开。
-        opened 用于上层判断「0 号是否存在摄像头子系统」，决定要不要继续往后探。
-        """
         cap = cv2.VideoCapture(index, flag)
         if not cap.isOpened():
             cap.release()
             return None, False
-
-        # 关键：分辨率/格式必须在预热读帧之前设好。旧代码先用默认分辨率预热、之后才设 720p，
-        # 4K 机就会拿 3840x2160 大帧预热，读帧奇慢——这正是换 4K 摄像头后"卡 + 打不开"的元凶之一。
         if use_mjpg:
             try:
                 cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
             except Exception:
                 pass
         if force_720p:
-            # 1280x720：低分辨率会让远处/小工具像素不足而漏检，先保检测能力（之前降到 640x480 识别不出）。
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        # 缓冲设为 1：丢掉积压旧帧，始终拿最新画面，消除"慢半拍"
         try:
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         except Exception:
             pass
-
         for _ in range(warmup_frames):
             ret, frame = cap.read()
             if ret and frame is not None and float(frame.std()) > 6.0:
                 return cap, True
             time.sleep(0.05)
-
         cap.release()
         return None, True
 
     def _open_camera(self, max_index=2, warmup_frames=8):
-        """打开一个可用摄像头，返回配置好的 VideoCapture（失败返回 None）。
-
-        换摄像头也能用——不写死设备号、不写死后端、不靠单帧判断：
-          - 逐个设备号（0→max_index，外接 USB 常在 1、2）× 逐项尝试矩阵 _CAM_ATTEMPTS
-            （DSHOW/MSMF 双后端 + 720p/native 双分辨率 + 选配 MJPG），第一个出真画面的就用。
-          - 关键早退出：若 0 号在**所有后端**都连打开都失败，说明基本没有摄像头子系统，直接放弃，
-            不再往后探。因为 DSHOW 探测不存在的设备号每个要卡 7-9s，无摄像头的机器否则要白等。
-          - 预热读最多 warmup_frames 帧：很多摄像头首帧是黑/绿/花屏，读到方差够大（std>6.0，
-            能区分真画面与均匀灰屏的虚拟设备）就判定可用，避免把预热慢的真摄像头误判成无摄像头。
-        """
         for index in range(max_index + 1):
             opened_any = False
             for flag, bname, force_720p, use_mjpg in self._CAM_ATTEMPTS:
@@ -450,19 +528,15 @@ class ToolDetectionApp:
                     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                     diag(f"摄像头探测：设备{index} {bname} {res} → ✅ 打开成功 {w}x{h}")
                     return cap
-                # 失败也记日志（写进 run_diag.txt），方便在接了摄像头那台机器远程定位卡在哪
                 why = "连打开都失败" if not opened else "能打开但读不到真画面(忙/格式不出流)"
                 diag(f"摄像头探测：设备{index} {bname} {res} → ✗ {why}")
-            # 0 号所有后端都打不开 → 基本无摄像头，立即放弃，避免后续设备号的 7-9s 空卡
             if index == 0 and not opened_any:
                 diag("摄像头探测：0号所有后端都打不开 → 判定无摄像头子系统，停止探测")
                 break
-
         diag("⚠️ 未找到可用摄像头，回退到选图片模式")
         return None
 
     def _check_ready(self):
-        """检测前置检查：检测器就绪 + 有可用工具。不通过弹框并返回 False。"""
         if self.detector_engine is None:
             messagebox.showwarning(
                 "检测器未就绪",
@@ -477,7 +551,6 @@ class ToolDetectionApp:
         return True
 
     def _reset_frame_state(self):
-        """清掉上一轮残留的帧/框，避免新一轮开头闪到旧画面。"""
         self._last_boxes = []
         self._last_annotated = None
         with self._frame_lock:
@@ -485,18 +558,17 @@ class ToolDetectionApp:
             self._display_frame = None
 
     def _begin_realtime(self, status_text):
-        """启动实时模式（摄像头/视频共用）：读帧线程 + 主线程 UI 泵。"""
         self.running = True
         self.should_speak = True
+        self._show_panel = True          # 检测开始 → 显示右侧清单
         self._reset_frame_state()
         self._set_buttons_running(True)
-        self.stats_label.config(text=status_text, fg=C_GREEN)
+        self.set_status(status_text, C_GREEN)
         self.detection_thread = threading.Thread(target=self.detection_loop, daemon=True)
         self.detection_thread.start()
         self._start_ui_pump()
 
     def detect_camera(self):
-        """摄像头检测：打开摄像头 → 实时双线程检测。"""
         if self.running:
             self.stop_detection()
         if not self._check_ready():
@@ -506,7 +578,7 @@ class ToolDetectionApp:
             messagebox.showwarning(
                 "未找到摄像头",
                 "没有检测到可用摄像头。\n请检查摄像头是否插好/被占用，"
-                "或改用「🎬 视频检测」「🖼 图片检测」。")
+                "或改用「视频检测」「图片检测」。")
             return
         self.cap = cap
         self.use_camera = True
@@ -515,7 +587,6 @@ class ToolDetectionApp:
         self._begin_realtime("正在检测（摄像头实时）…")
 
     def detect_image(self):
-        """图片检测：选一张图片 → 检测一次。"""
         if self.running:
             self.stop_detection()
         if not self._check_ready():
@@ -541,23 +612,17 @@ class ToolDetectionApp:
         self.is_video_file = False
         self.running = True
         self.should_speak = True
+        self._show_panel = True          # 图片检测 → 显示右侧清单（结果）
         self._reset_frame_state()
         self._set_buttons_running(True)
-        self.stats_label.config(text="检测图片中…", fg=C_AMBER)
         self.detection_thread = threading.Thread(target=self.detection_loop, daemon=True)
-        self.detection_thread.start()   # 静态图一次性显示，不需要 UI 泵
+        self.detection_thread.start()
 
     def open_video(self):
-        """选一个视频文件，按原生帧率播放并实时检测（复用摄像头双线程逻辑）。
-
-        与摄像头的区别：① 视频读帧不会自带节奏，要按视频 fps 主动限速，否则一闪而过；
-        ② 放到结尾要自动停。这两点在 _camera_loop 里按 is_video_file 处理。
-        """
         if self.running:
             self.stop_detection()
         if not self._check_ready():
             return
-
         initial_dir = str(DATA_DIR / "video")
         if not os.path.isdir(initial_dir):
             initial_dir = str(DATA_DIR)
@@ -569,65 +634,47 @@ class ToolDetectionApp:
         )
         if not file_path:
             return
-
         cap = cv2.VideoCapture(file_path)
         if not cap.isOpened():
             messagebox.showerror("错误", f"无法打开视频：\n{file_path}")
             return
-
         self.cap = cap
-        self.use_camera = True       # 走实时双线程循环（读帧+后台推理）
+        self.use_camera = True
         self.is_video_file = True
         self.static_frame = None
         fps = cap.get(cv2.CAP_PROP_FPS)
         self.video_fps = fps if fps and fps > 1 else 25.0
-
         self._begin_realtime(f"正在检测视频（{os.path.basename(file_path)}）…")
 
     def stop_detection(self):
         self.running = False
         self.should_speak = False
-        self._infer_running = False   # 停掉后台推理线程
-        self.voice.stop()             # 立刻打断正在念的语音（不管念没念完）
-
+        self._infer_running = False
+        self._show_panel = False         # 停止检测 → 隐藏右侧清单
+        self.voice.stop()
         if self.cap is not None:
             self.cap.release()
             self.cap = None
-
         self._set_buttons_running(False)
         self.refresh_visible_list()
-        self.stats_label.config(text="已停止", fg="#ff6b6b")
+        self.set_status("已停止", "#ff6b6b")
 
     def reset_display(self):
-        """清空显示 = 停止当前检测 + 清空 last_seen + 清空画面。
-
-        必须先停检测，否则静态/摄像头线程会立刻把 last_seen 填回去，看起来"没清掉"。
-        """
         if self.running:
             self.stop_detection()
-
         self.last_seen = {}
         self.last_counts = {}
         self._last_boxes = []
         self._last_annotated = None
+        self._show_panel = False    # 清空 → 隐藏右侧清单
+        self._cur_base = None       # 回到空闲暗底
         try:
             self.refresh_visible_list()
-            self.video_label.configure(image="", text="📷  点击下方按钮开始检测")
-            self.video_label.imgtk = None
-            self.stats_label.config(text="已清空，待检测", fg=C_MUTED)
+            self.set_status("已清空，待检测", C_MUTED)
         except Exception as e:
             print(f"清空显示出错: {e}")
 
     # ---------------- 检测循环 ----------------
-
-    def _show_frame(self, frame_bgr):
-        """把 BGR 帧渲染到视频区"""
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        img = Image.fromarray(frame_rgb)
-        img.thumbnail((900, 650))
-        imgtk = ImageTk.PhotoImage(image=img)
-        self.video_label.imgtk = imgtk
-        self.video_label.configure(image=imgtk)
 
     def detection_loop(self):
         try:
@@ -640,66 +687,44 @@ class ToolDetectionApp:
             self.stop_detection()
 
     def _start_ui_pump(self):
-        """复位 UI 泵状态并在主线程启动它（由主线程的按钮回调调用）。"""
         self._last_shown_id = -1
         self._last_recog = None
         self._last_ui_refresh = 0.0
-        self._last_speak = time.time()   # 首次播报推迟 SPEAK_INTERVAL，别一打开就念一堆
+        self._last_speak = time.time()
         with self._frame_lock:
             self._display_frame = None
             self._display_id = 0
         self.root.after(0, self._ui_pump)
 
     def _camera_loop(self):
-        """读帧线程：持续读帧 → 叠最近的框（纯 cv2，不碰 Tkinter）→ 存成待显示帧。
-
-        三方分工：本线程只读帧+叠框（不碰 Tkinter）；_inference_worker 后台跑推理回写框；
-        主线程 _ui_pump 取待显示帧画图+刷列表。Tkinter 全在主线程，避免黑屏闪烁。
-        框常驻：每帧把推理线程最新回写的 _last_boxes 叠上（render_live 缓存贴图，几乎零开销），
-        所以框跟着实时画面、不闪。
-        """
-        self._box_store = {}  # 清掉上一轮的框存活记录
-        # 启动后台推理线程
+        self._box_store = {}
         self._infer_running = True
         worker = threading.Thread(target=self._inference_worker, daemon=True)
         worker.start()
 
-        # 视频文件：按原生帧率播放（否则读多快放多快，一闪而过）
         frame_interval = (1.0 / self.video_fps) if self.is_video_file else 0.0
         next_frame_t = time.time()
-
-        # 诊断计数（读帧帧率）
         diag_t0 = time.time()
         diag_frames = 0
         while self.running and self.cap is not None:
             ret, frame = self.cap.read()
             if not ret:
                 if self.is_video_file:
-                    break          # 视频放完 → 退出循环，自动停止
-                time.sleep(0.05)   # 摄像头偶发读帧失败 → 重试
+                    break
+                time.sleep(0.05)
                 continue
-
             now = time.time()
             diag_frames += 1
-
-            # 把最新帧交给推理线程（只存引用，worker 取用时自己 copy）
             with self._frame_lock:
                 self._latest_frame = frame
-
-            # 叠框（纯 cv2/numpy，不碰 Tkinter）。每帧把推理线程最新回写的框叠上 → 框常驻不闪
             if self.use_yolo:
                 display = (self.detector_engine.render_live(frame.copy(), self._last_boxes)
                            if self._last_boxes else frame)
             else:
                 display = self._last_annotated if self._last_annotated is not None else frame
-
-            # 存成"待显示帧"，交给主线程 _ui_pump 去画。绝不在这个后台线程里调 Tkinter——
-            # 后台线程直接建 PhotoImage/configure 会和主线程重绘抢，导致画面间歇性闪黑。
             with self._frame_lock:
                 self._display_frame = display
                 self._display_id += 1
-
-            # 每 2 秒报一次读帧帧率（写进 run_diag.txt 便于远程诊断）
             if now - diag_t0 >= 2.0:
                 fps = diag_frames / (now - diag_t0)
                 hit = len([n for n, t in list(self.last_seen.items())
@@ -707,36 +732,24 @@ class ToolDetectionApp:
                 diag(f"读帧线程：{fps:.1f} fps，窗口内命中 {hit} 个")
                 diag_t0 = now
                 diag_frames = 0
-
-            # 限速：视频文件按原生帧率播放；摄像头只让出极短时间
             if self.is_video_file:
                 next_frame_t += frame_interval
                 delay = next_frame_t - time.time()
                 if delay > 0:
                     time.sleep(delay)
                 else:
-                    next_frame_t = time.time()   # 落后了就别越积越多
+                    next_frame_t = time.time()
             else:
                 time.sleep(0.01)
 
-        # 读帧线程退出 → 通知推理线程收尾
         self._infer_running = False
-
-        # 视频自然放完（非手动停止）→ 回主线程复位按钮与状态
         if self.is_video_file and self.running:
             self.root.after(0, self._on_video_finished)
 
     def _ui_pump(self):
-        """主线程 UI 泵：定时取最新"待显示帧"来画 + 刷列表 + 触发语音。
-
-        所有 Tkinter 操作都在这里（主线程）完成，跟 mainloop 重绘同步，
-        避免后台线程直接画图导致的黑屏闪烁。running=False 时自动停止重调度。
-        """
         if not self.running:
             return
         now = time.time()
-
-        # 只在有新帧时才画（避免重复建 PhotoImage）
         with self._frame_lock:
             frame = self._display_frame
             did = self._display_id
@@ -744,7 +757,6 @@ class ToolDetectionApp:
             self._show_frame(frame)
             self._last_shown_id = did
 
-        # 列表刷新：识别集合变化就刷（节流 1s），否则每 UI_REFRESH_INTERVAL 兜底
         recog_now = frozenset(n for n, t in list(self.last_seen.items())
                               if now - t < VISIBILITY_WINDOW)
         if ((recog_now != self._last_recog and now - self._last_ui_refresh >= 1.0)
@@ -753,49 +765,35 @@ class ToolDetectionApp:
             self._last_ui_refresh = now
             self._last_recog = recog_now
 
-        # 语音播报（report 非阻塞，瞬间返回）
         if self.should_speak and now - self._last_speak >= SPEAK_INTERVAL:
             self.speak_missing()
             self._last_speak = now
 
-        self.root.after(15, self._ui_pump)   # ~每 15ms 一次，跟随主循环重绘
+        self.root.after(15, self._ui_pump)
 
     def _on_video_finished(self):
-        """视频播放结束后在主线程里复位 UI（手动停止不走这里）。"""
         self.running = False
         if self.cap is not None:
             self.cap.release()
             self.cap = None
         self._set_buttons_running(False)
         self.refresh_visible_list()
-        self.stats_label.config(text="视频检测完毕", fg="#00ff88")
+        self.set_status("视频检测完毕", "#00ff88")
 
     def _hold_boxes(self, boxes):
-        """框防闪：每个工具的框按名字保留 VISIBILITY_WINDOW 秒。
-
-        阈值边缘的工具会一会儿检到、一会儿漏掉，若每次推理直接用当次结果，框就一闪一闪。
-        这里把"最近一次检到的框"按工具名存活一段时间：偶尔漏检不立刻抹掉、沿用上次位置，
-        直到真的超过存活期才消失。返回当前应显示的框列表（每个工具一个，取最新位置）。
-        只有推理线程调用，self._box_store 不跨线程写，赋值给 _last_boxes 是原子操作。
-        """
         now = time.time()
         for b in boxes:
-            self._box_store[b[4]] = (b, now)   # b[4] 是工具中文名
+            self._box_store[b[4]] = (b, now)
         held = []
         for name in list(self._box_store.keys()):
             b, ts = self._box_store[name]
             if now - ts < VISIBILITY_WINDOW:
                 held.append(b)
             else:
-                del self._box_store[name]       # 过期 → 框消失
+                del self._box_store[name]
         return held
 
     def _inference_worker(self):
-        """后台推理线程：每 DETECT_INTERVAL 取一次最新帧跑 YOLO/SIFT，
-        只回写 _last_boxes / last_seen / last_counts，不碰 Tkinter（线程安全）。
-
-        与显示线程解耦：推理慢只拖慢"框刷新率"，绝不阻塞显示线程读帧/显示。
-        """
         last_detect = 0.0
         diag_t0 = time.time()
         diag_infer_ms = 0.0
@@ -811,7 +809,6 @@ class ToolDetectionApp:
                 time.sleep(0.01)
                 continue
             last_detect = now
-
             t_infer = time.time()
             try:
                 if self.use_yolo:
@@ -825,7 +822,6 @@ class ToolDetectionApp:
                 detected, counts = set(), {}
             diag_infer_ms += (time.time() - t_infer) * 1000
             diag_infers += 1
-
             stamp = time.time()
             for name in detected:
                 self.last_seen[name] = stamp
@@ -836,7 +832,6 @@ class ToolDetectionApp:
                 f"{n}={counts.get(n, 0)}{self.last_source.get(n, '')}"
                 for n in sorted(detected))
             print(f"[检测 {len(detected)}个] {hits or '(空)'}")
-
             if stamp - diag_t0 >= 2.0:
                 avg = diag_infer_ms / max(diag_infers, 1)
                 diag(f"推理线程：{avg:.0f} ms/帧 × {diag_infers} 次/2s")
@@ -852,27 +847,23 @@ class ToolDetectionApp:
         self.last_counts.update(counts)
         self.last_source = dict(getattr(self.detector_engine, "last_source", {}))
         self.detect_threshold = getattr(self.detector_engine, "last_threshold", 0)
-        self._show_frame(display)
         recognized_count = self.refresh_visible_list()
         if self.should_speak:
             self.speak_missing()
-
         self.running = False
         try:
             self._set_buttons_running(False)
             total = len(self._valid_tools())
-            # 底部数字必须和上方列表一致——用 refresh 返回的 recognized_count，
-            # 而不是本帧 len(detected)；连续多次点检测时窗口里旧条目仍算
-            self.stats_label.config(
-                text=f"检测完成：识别 {recognized_count}/{total}",
-                fg="#00ff88")
+            self._status_text = f"检测完成：识别 {recognized_count}/{total}"
+            self._status_color = "#00ff88"
+            self._cur_base = display          # 静态图作底图
+            self._recompose_idle()            # 末尾统一重绘（此时 running=False）
         except Exception:
             pass
 
     # ---------------- 语音 ----------------
 
     def speak_missing(self):
-        """播报当前还缺失的工具（基于可见性窗口）"""
         all_tools = set(t["name"] for t in self._valid_tools())
         now = time.time()
         currently_visible = {
