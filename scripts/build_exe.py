@@ -53,24 +53,46 @@ PyInstaller.__main__.run([
     "--hidden-import=win32com.client",
 ])
 
-# ============ 构建后：把 YOLO 模型外置到 exe 旁边 ============
-# data/ 解析逻辑见 src/utils.py：frozen 时按 exe 同级目录找 data/
+# ============ 构建后：把运行时数据外置到 exe 旁边 ============
+# data/ 解析逻辑见 src/utils.py：frozen 时按 exe 同级目录找 data/。
+# YOLO 模式运行时只需要 yolo/best.pt + yolo/class_map.json；
+# smart_tools.json 仅在 best.pt 缺失回退 SIFT 时才用到，一并带上做兜底。
+dst_data = DIST_DIR / "data"
+
+# 1) YOLO 模型 + 类名映射（核心）
 src_yolo = PROJECT_ROOT / "data" / "yolo"
-dst_yolo = DIST_DIR / "data" / "yolo"
+dst_yolo = dst_data / "yolo"
 if src_yolo.is_dir():
     dst_yolo.mkdir(parents=True, exist_ok=True)
     for fn in ("best.pt", "class_map.json"):
         f = src_yolo / fn
         if f.is_file():
             shutil.copy2(f, dst_yolo / fn)
-            print(f"  已复制模型文件: {fn}")
+            print(f"  已复制: data/yolo/{fn}")
         else:
-            print(f"  缺少 {fn}（best.pt 缺失则程序启动后点检测会提示）")
+            print(f"  ⚠️ 缺少 data/yolo/{fn}（best.pt 缺失则启动后点检测会提示）")
 else:
-    print("  data/yolo 不存在，未复制模型")
+    print("  ⚠️ data/yolo 不存在，未复制模型")
+
+# 2) smart_tools.json（SIFT 回退兜底，可选）
+sj = PROJECT_ROOT / "data" / "smart_tools.json"
+if sj.is_file():
+    dst_data.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(sj, dst_data / "smart_tools.json")
+    print("  已复制: data/smart_tools.json（回退兜底）")
+
+# 3) 选图/选视频对话框的默认目录（建空目录，避免对话框打开到奇怪位置）
+for sub in ("samples", "video"):
+    src_sub = PROJECT_ROOT / "data" / sub
+    dst_sub = dst_data / sub
+    if src_sub.is_dir():
+        shutil.copytree(src_sub, dst_sub, dirs_exist_ok=True)
+        print(f"  已复制: data/{sub}/")
+    else:
+        dst_sub.mkdir(parents=True, exist_ok=True)
 
 print("\n" + "=" * 60)
-print("打包完成！")
-print(f"可执行文件：{DIST_DIR / (APP_NAME + '.exe')}")
-print(f"整个 {DIST_DIR.name}/ 文件夹拷给别人即可双击运行。")
+print("✅ 打包完成！")
+print(f"双击运行：{DIST_DIR / (APP_NAME + '.exe')}")
+print(f"把整个『{DIST_DIR.name}』文件夹拷给别人，双击里面的 .exe 即可秒开，无需任何命令。")
 print("=" * 60)
