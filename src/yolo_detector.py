@@ -174,13 +174,7 @@ class YoloToolDetector:
                 drawer.text((x1, y_text), label, font=self._font, fill=(0, 255, 0))
             display = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
-        # 顶部统计（英文，cv2 即可）
-        detected_count = len({b[4] for b in boxes_to_draw})
-        total = len(self.class_map) if self.class_map else len(self.model.names)
-        cv2.putText(
-            display, f"Tools: {detected_count}/{total}",
-            (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2,
-        )
+        # 计数由 GUI 悬浮清单展示，这里不再往画面上画 "Tools: x/y"
         return display
 
     def _label_sprite(self, text):
@@ -221,12 +215,7 @@ class YoloToolDetector:
             x = max(0, min(x1, w - sw))
             frame_bgr[y:y + sh, x:x + sw] = spr
 
-        detected_count = len({b[4] for b in boxes_to_draw})
-        total = len(self.class_map) if self.class_map else len(self.model.names)
-        cv2.putText(
-            frame_bgr, f"Tools: {detected_count}/{total}",
-            (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2,
-        )
+        # 计数由 GUI 悬浮清单展示，这里不再往画面上画 "Tools: x/y"
         return frame_bgr
 
     def detect(self, frame_bgr):
