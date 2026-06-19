@@ -388,14 +388,19 @@ class ToolDetectionApp:
         (cv2.CAP_DSHOW, "DSHOW", False, False),
     ]
 
-    def _try_open(self, index, flag, force_720p, use_mjpg, warmup_frames):
+    def _try_open(self, index, flag, force_720p, use_mjpg, warmup_frames, budget=2.5):
         """按指定后端/分辨率/格式打开一次，预热读帧判断是否有真画面。
 
         返回 (cap 或 None, opened)：
           - cap 非 None  → 出了真画面，已配好，可直接用；
-          - cap 为 None 且 opened=True  → 设备能打开但没出可用画面（黑/灰屏或出流失败）；
+          - cap 为 None 且 opened=True  → 设备能打开但没出可用画面（黑/灰屏或出流失败/被占用）；
           - cap 为 None 且 opened=False → 这个设备号/后端根本打不开。
         opened 用于上层判断「0 号是否存在摄像头子系统」，决定要不要继续往后探。
+
+        budget：本次尝试的「读真画面」总时间预算（秒）。摄像头被别的程序占用时，
+        设备句柄能打开但 cap.read() 一直读不到真画面、会一直阻塞重试——没有这个预算，
+        一次尝试能干等 9~13s，6 个组合叠起来就是「点了检测半天不出画面」。加预算后
+        每次尝试最多卡 ~budget 秒就放弃，占用场景从一分多钟降到十几秒并能明确提示。
         """
         cap = cv2.VideoCapture(index, flag)
         if not cap.isOpened():
@@ -419,10 +424,15 @@ class ToolDetectionApp:
         except Exception:
             pass
 
+        deadline = time.time() + budget
         for _ in range(warmup_frames):
             ret, frame = cap.read()
             if ret and frame is not None and float(frame.std()) > 6.0:
                 return cap, True
+            # 超出时间预算就立即放弃这次尝试——被占用时 read() 会持续读不到真画面，
+            # 不设这个上限就会一直耗到 warmup_frames 用完（每次 9~13s）。
+            if time.time() >= deadline:
+                break
             time.sleep(0.05)
 
         cap.release()
@@ -439,6 +449,10 @@ class ToolDetectionApp:
           - 预热读最多 warmup_frames 帧：很多摄像头首帧是黑/绿/花屏，读到方差够大（std>6.0，
             能区分真画面与均匀灰屏的虚拟设备）就判定可用，避免把预热慢的真摄像头误判成无摄像头。
         """
+        # 失败原因：None=还没结论 / "busy"=能打开但读不到真画面(疑似被占用) / "none"=根本没摄像头。
+        # 给 detect_camera 用来决定弹「被占用」还是「没找到摄像头」两种不同提示。
+        self._cam_fail_reason = None
+        busy_any = False
         for index in range(max_index + 1):
             opened_any = False
             for flag, bname, force_720p, use_mjpg in self._CAM_ATTEMPTS:
@@ -451,14 +465,26 @@ class ToolDetectionApp:
                     diag(f"摄像头探测：设备{index} {bname} {res} → ✅ 打开成功 {w}x{h}")
                     return cap
                 # 失败也记日志（写进 run_diag.txt），方便在接了摄像头那台机器远程定位卡在哪
+                if opened:
+                    busy_any = True   # 能打开但读不到真画面 → 设备存在，多半是被占用/格式不出流
                 why = "连打开都失败" if not opened else "能打开但读不到真画面(忙/格式不出流)"
                 diag(f"摄像头探测：设备{index} {bname} {res} → ✗ {why}")
             # 0 号所有后端都打不开 → 基本无摄像头，立即放弃，避免后续设备号的 7-9s 空卡
             if index == 0 and not opened_any:
                 diag("摄像头探测：0号所有后端都打不开 → 判定无摄像头子系统，停止探测")
                 break
+            # 0 号能打开、但每种后端/格式都读不到真画面 → 极可能被别的程序(oCam/微信/浏览器/相机)
+            # 独占了。再往后探设备 1/2 也大概率同样被占，没必要白等，直接停下给「被占用」提示。
+            if index == 0 and busy_any:
+                diag("摄像头探测：0号能打开但全程读不到画面 → 疑似被其它程序占用，停止探测")
+                break
 
-        diag("⚠️ 未找到可用摄像头，回退到选图片模式")
+        if busy_any:
+            self._cam_fail_reason = "busy"
+            diag("⚠️ 摄像头疑似被其它程序占用（请关闭 oCam/微信视频/浏览器/相机后重试）")
+        else:
+            self._cam_fail_reason = "none"
+            diag("⚠️ 未找到可用摄像头，回退到选图片模式")
         return None
 
     def _check_ready(self):
@@ -503,10 +529,22 @@ class ToolDetectionApp:
             return
         cap = self._open_camera()
         if cap is None:
-            messagebox.showwarning(
-                "未找到摄像头",
-                "没有检测到可用摄像头。\n请检查摄像头是否插好/被占用，"
-                "或改用「🎬 视频检测」「🖼 图片检测」。")
+            if getattr(self, "_cam_fail_reason", None) == "busy":
+                # 能打开但读不到画面 = 设备在、被独占。明确告诉用户关掉占用程序，别让他以为是程序坏了。
+                messagebox.showwarning(
+                    "摄像头被占用",
+                    "摄像头能打开、但读不到画面，多半是被其它程序占用了。\n\n"
+                    "请先关闭这些程序后再点检测：\n"
+                    "  • oCam / 录屏软件\n"
+                    "  • 微信 / QQ / 腾讯会议 的视频\n"
+                    "  • 浏览器里开着摄像头的网页\n"
+                    "  • Windows「相机」App\n\n"
+                    "关掉后再点「📷 摄像头检测」即可秒开；也可改用「🎬 视频检测」「🖼 图片检测」。")
+            else:
+                messagebox.showwarning(
+                    "未找到摄像头",
+                    "没有检测到可用摄像头。\n请检查摄像头是否插好，"
+                    "或改用「🎬 视频检测」「🖼 图片检测」。")
             return
         self.cap = cap
         self.use_camera = True

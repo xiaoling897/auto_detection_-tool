@@ -4,10 +4,26 @@
 
 训练完成后：自动把 best.pt 复制到 data/yolo/best.pt，覆盖之前的占位模型。
 """
+import os
+
+# ⚠️ 必须在 import torch/ultralytics 之前设：限制 OpenMP/MKL 线程数。
+# 28 逻辑核满载跑 OpenMP 在 Windows 上长时间会偶发原生崩溃（无 Python 堆栈、训练中途
+# 硬断）。压到 8 线程后稳定，CPU 训练速度几乎不受影响（瓶颈本就不在线程数）。
+os.environ.setdefault("OMP_NUM_THREADS", "8")
+os.environ.setdefault("MKL_NUM_THREADS", "8")
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+# 屏蔽 GPU/图形资源：显示驱动 TDR 崩溃时不连坐训练进程（纯 CPU 训练，不需要 GPU）。
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+os.environ.setdefault("OPENCV_OPENCL_RUNTIME", "disabled")
+os.environ.setdefault("OPENCV_OPENCL_DEVICE", "disabled")
+
 import shutil
 from pathlib import Path
 
+import torch
 from ultralytics import YOLO
+
+torch.set_num_threads(8)
 
 # ============ 路径 ============
 SCRIPT_DIR = Path(__file__).resolve().parent

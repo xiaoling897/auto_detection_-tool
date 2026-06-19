@@ -6,10 +6,32 @@
 
 完成后和 train_yolo.py 一样：把 best.pt 复制到 data/yolo/best.pt。
 """
+import os
+
+# ⚠️ 必须在 import torch/ultralytics 之前设：限制 OpenMP/MKL 线程数。
+# 这台机器有 28 个逻辑核，torch 默认会铺满所有核跑 OpenMP，hybrid P/E 核 + 高线程
+# 在 Windows 上长时间满载会偶发原生层崩溃（无 Python 堆栈、无 Windows 崩溃事件、
+# 训练跑几分钟后从迭代中途硬断）——之前三次训练都死在这上面。把线程数压到 8 既稳又够快。
+os.environ.setdefault("OMP_NUM_THREADS", "8")
+os.environ.setdefault("MKL_NUM_THREADS", "8")
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")  # 顺手防 libiomp 重复初始化 abort
+
+# ⚠️ 让训练进程完全不持有任何 GPU/图形资源。
+# 这台机器的显示驱动（向日葵虚拟显示器 OrayIddDriver / Intel UHD 770 旧驱动）在高负载下
+# 会偶发 TDR 崩溃（事件日志里 0x116/0x117/0x141 video TDR），把"摸过 GPU"的进程一起杀掉。
+# torch 会探测 CUDA、cv2 默认开 OpenCL —— 都会拿到图形句柄而被 TDR 连坐。
+# 训练本就是纯 CPU，这里强制屏蔽 GPU，进程不再有图形句柄，显示驱动崩了也波及不到它。
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")       # torch 看不到任何 CUDA 设备
+os.environ.setdefault("OPENCV_OPENCL_RUNTIME", "disabled")  # cv2 不走 OpenCL/GPU
+os.environ.setdefault("OPENCV_OPENCL_DEVICE", "disabled")
+
 import shutil
 from pathlib import Path
 
+import torch
 from ultralytics import YOLO
+
+torch.set_num_threads(8)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
