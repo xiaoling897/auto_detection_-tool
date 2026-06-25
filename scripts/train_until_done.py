@@ -20,6 +20,7 @@ RUNS = ROOT / "data" / "training" / "runs" / "tool_yolo"
 RESULTS = RUNS / "results.csv"
 BEST_PT = RUNS / "weights" / "best.pt"
 RESUME = ROOT / "scripts" / "resume_train.py"
+FRESH = ROOT / "scripts" / "train_yolo.py"   # 从头训练（没有进行中的训练时用）
 OUTPUT_BEST = ROOT / "data" / "yolo" / "best.pt"
 STATUS_LOG = ROOT / "data" / "training" / "watchdog_status.log"
 TARGET_EPOCHS = 80
@@ -69,12 +70,16 @@ def main():
             log(f"已完成 epoch {ep}/{TARGET_EPOCHS}，训练结束。")
             deploy_best()
             return
-        log(f"[第 {attempt} 次] 已完成 epoch {ep}/{TARGET_EPOCHS}，启动续训...")
+        # 没有进行中的训练(epoch 0 且无 last.pt)→ 从头训练；否则从 last.pt 续训。
+        fresh = (ep == 0 and not (RUNS / "weights" / "last.pt").exists())
+        script = FRESH if fresh else RESUME
+        log(f"[第 {attempt} 次] 已完成 epoch {ep}/{TARGET_EPOCHS}，"
+            f"{'从头训练' if fresh else '续训'}...")
 
         # 子进程输出收到独立文件，避免无控制台时写丢；也方便排查偶发崩溃。
         run_log = ROOT / "data" / "training" / f"resume_run_{attempt}.log"
         with open(run_log, "w", encoding="utf-8", errors="replace") as f:
-            rc = subprocess.run([sys.executable, str(RESUME)],
+            rc = subprocess.run([sys.executable, str(script)],
                                 stdout=f, stderr=subprocess.STDOUT).returncode
         ep2 = last_epoch()
 
