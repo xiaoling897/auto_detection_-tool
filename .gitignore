@@ -10,6 +10,8 @@ build/
 dist/
 # PyInstaller 每次构建自动生成，非源文件
 *.spec
+# Inno Setup 编译出的安装程序（几百 MB，可随时重新编译）
+/installer_output/
 
 # 训练数据集 / 标注中间产物 / 训练输出（太大，不进 git）
 /data/training/

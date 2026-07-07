@@ -28,12 +28,27 @@ DEBUG_CONSOLE = "--console" in sys.argv
 
 APP_NAME = "智能工具检测系统"
 DIST_DIR = PROJECT_ROOT / "dist" / APP_NAME
+ICON = PROJECT_ROOT / "assets" / "app_icon.ico"   # 换图标：直接覆盖这个文件即可
+
+# 瘦身：实时检测（YOLO 推理 + Tkinter GUI）用不到的重库，排除掉。
+#   polars(175M) —— ultralytics 导出结果表格用的 DataFrame 后端，推理不碰（实测排除后检测正常）
+#   IPython/pytest/PyQt/PySide/wx —— 开发/其它 GUI 框架，运行时无关
+# ⚠️ matplotlib 不能排除：ultralytics 在 `from ultralytics import YOLO` 时会急切
+#    import matplotlib.pyplot（models/yolo/semantic/train.py），排除会导致一点检测就崩。
+#    （已实测踩过这个坑，别再加回去。）
+# 万一某个排除项其实是必需的（启动报 ModuleNotFoundError），把它从这个列表删掉重打即可。
+EXCLUDES = [
+    "polars",
+    "IPython", "pytest", "notebook",
+    "PyQt5", "PyQt6", "PySide2", "PySide6", "wx",
+]
 
 print("=" * 60)
 print(f"打包：{APP_NAME}（onedir，{'调试版-带控制台' if DEBUG_CONSOLE else '正式版-无黑窗'}）")
+print(f"图标：{ICON if ICON.is_file() else '（未找到 assets/app_icon.ico，用默认图标）'}")
 print("=" * 60)
 
-PyInstaller.__main__.run([
+opts = [
     "run.py",
     f"--name={APP_NAME}",
     # 调试版用 --console 看诊断输出；正式版 --windowed 不弹黑窗
@@ -51,7 +66,12 @@ PyInstaller.__main__.run([
     "--hidden-import=PIL._tkinter_finder",
     "--hidden-import=win32com",
     "--hidden-import=win32com.client",
-])
+]
+if ICON.is_file():
+    opts.append(f"--icon={ICON}")
+opts += [f"--exclude-module={m}" for m in EXCLUDES]
+
+PyInstaller.__main__.run(opts)
 
 # ============ 构建后：把运行时数据外置到 exe 旁边 ============
 # data/ 解析逻辑见 src/utils.py：frozen 时按 exe 同级目录找 data/。
@@ -81,15 +101,17 @@ if sj.is_file():
     shutil.copy2(sj, dst_data / "smart_tools.json")
     print("  已复制: data/smart_tools.json（回退兜底）")
 
-# 3) 选图/选视频对话框的默认目录（建空目录，避免对话框打开到奇怪位置）
-for sub in ("samples", "video"):
-    src_sub = PROJECT_ROOT / "data" / sub
-    dst_sub = dst_data / sub
-    if src_sub.is_dir():
-        shutil.copytree(src_sub, dst_sub, dirs_exist_ok=True)
-        print(f"  已复制: data/{sub}/")
-    else:
-        dst_sub.mkdir(parents=True, exist_ok=True)
+# 3) 选图对话框的默认目录（带上样图，方便无摄像头时试用）
+src_samples = PROJECT_ROOT / "data" / "samples"
+dst_samples = dst_data / "samples"
+if src_samples.is_dir():
+    shutil.copytree(src_samples, dst_samples, dirs_exist_ok=True)
+    print("  已复制: data/samples/")
+else:
+    dst_samples.mkdir(parents=True, exist_ok=True)
+
+# 4) 选视频对话框的默认目录：只建空目录，不带几十 MB 的测试视频（瘦身）
+(dst_data / "video").mkdir(parents=True, exist_ok=True)
 
 print("\n" + "=" * 60)
 print("✅ 打包完成！")

@@ -125,19 +125,24 @@ python tests/test_image_detect.py data/samples/all_tools.jpg
 # 重建 smart_tools.json（加新模板后）
 python scripts/extract_features.py
 
-<<<<<<< HEAD
-# 打包 EXE（onedir 文件夹分发，自动把 data/yolo/best.pt 复制进产物）
+# === 出包 ===
+# 【推荐】一键出包：打包 + 封成 Setup.exe 一步到位
+python scripts/build_all.py             # 正式版；加 --console 出调试版
+# 产物：installer_output/智能工具检测系统_安装程序_v1.0.0.exe（约 200M）——发这一个文件，双击安装
+
+# 也可分两步单独跑：
+# 1) PyInstaller 打成 onedir 文件夹（自动嵌图标 assets/app_icon.ico、复制 data/yolo/best.pt）
 python scripts/build_exe.py             # 正式版：--windowed 无黑窗
 python scripts/build_exe.py --console   # 调试版：保留黑窗，能看 diag() 实时诊断 + run_diag.txt
-# 产物：dist/智能工具检测系统/  —— 整个文件夹拷给别人即可双击运行（含 _internal/ 依赖 + data/）
-# 注：构建会在根目录生成 智能工具检测系统.spec（PyInstaller 自动产物，已 gitignore，可随时删）
-# Windows GBK 控制台跑构建/训练脚本前先设 PYTHONIOENCODING=utf-8，否则 emoji print 会 UnicodeEncodeError
-=======
-# 打包 EXE
-python scripts/build_exe.py
+# 产物：dist/智能工具检测系统/  —— 绿色免安装版，整个文件夹拷走即可双击运行（约 730M）
+# 2) 用 Inno Setup 封成单文件安装程序 Setup.exe（开始菜单/桌面快捷方式带图标、可卸载）
+python scripts/build_installer.py
 
-
-
-
->>>>>>> 44ab011408d0834e3e210402c1a0d5899e00fb2d
+# 注：
+# - 构建会在根目录生成 智能工具检测系统.spec（PyInstaller 自动产物，已 gitignore）
+# - Windows GBK 控制台跑构建脚本前先设 PYTHONIOENCODING=utf-8，否则 emoji print 会 UnicodeEncodeError
+# - 换图标：覆盖 assets/app_icon.ico（或 python scripts/make_icon.py 你的图.png 重新生成）后重打
+# - 瘦身：build_exe.py 里 EXCLUDES 排除了 polars(175M) 等；⚠️ matplotlib 不能排除——
+#   ultralytics 在 import YOLO 时急切 import matplotlib.pyplot，排除会导致一点检测就崩
+# - 装安装包工具：winget install JRSoftware.InnoSetup（ISCC.exe 在用户目录，build_installer.py 会自动找）
 ```
