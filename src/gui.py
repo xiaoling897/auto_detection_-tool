@@ -22,6 +22,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 
 import cv2
+import numpy as np
 from PIL import Image, ImageTk
 
 from .detector import ToolDetector
@@ -36,6 +37,9 @@ VISIBILITY_WINDOW = 3.0     # 工具可见性窗口（去抖）：最近 N 秒�
                             # 避免拿走一个工具时把旁边被手挡住的工具误报成缺失。
                             # 太小→误报缺失；太大→真拿走后要等更久才报。同时影响列表/框/语音。
 SPEAK_INTERVAL = 8.0        # 语音播报间隔
+BAD_FRAME_LIMIT = 3         # 摄像头连续坏帧达到这个次数后，清掉旧框和旧识别结果
+BLANK_MEAN_THRESHOLD = 6.0  # 接近全黑的平均亮度阈值
+BLANK_STD_THRESHOLD = 4.0   # 接近纯色黑屏的纹理/方差阈值
 
 # ---- 配色（统一暗色主题，集中放这里方便整体换肤）----
 C_BG = "#0f1629"            # 窗口主背景（深海军蓝）
@@ -144,6 +148,7 @@ class ToolDetectionApp:
         self._last_recog = None
         self._last_ui_refresh = 0.0
         self._last_speak = 0.0
+        self._camera_signal_lost = False
 
         diag("=" * 50)
         diag(f"启动诊断：后端={'YOLO' if self.use_yolo else 'SIFT(回退)'}, "
@@ -372,6 +377,47 @@ class ToolDetectionApp:
             return list(self.tools)
         return [t for t in self.tools if t.get("des") is not None]
 
+    @staticmethod
+    def _is_blank_frame(frame):
+        """判断摄像头是否吐出了接近全黑/无信号的坏帧。"""
+        if frame is None or getattr(frame, "size", 0) == 0:
+            return True
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        return (float(gray.mean()) < BLANK_MEAN_THRESHOLD
+                and float(gray.std()) < BLANK_STD_THRESHOLD)
+
+    def _clear_realtime_detection_state(self):
+        """清理实时检测缓存，避免旧框/旧结果挂在坏帧上。"""
+        self.last_seen = {}
+        self.last_counts = {}
+        self.last_source = {}
+        self._last_boxes = []
+        self._box_store = {}
+        self._last_annotated = None
+        self._last_recog = None
+        self._last_ui_refresh = 0.0
+        with self._frame_lock:
+            self._latest_frame = None
+
+    def _signal_lost_frame(self, reference=None):
+        """生成一个无信号占位帧，替代黑屏叠旧框。"""
+        if reference is not None and getattr(reference, "ndim", 0) >= 2:
+            h, w = reference.shape[:2]
+        else:
+            h, w = 720, 1280
+        frame = np.full((h, w, 3), (26, 14, 10), dtype=np.uint8)
+        cv2.putText(
+            frame,
+            "Camera signal lost, retrying...",
+            (30, 55),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.9,
+            (248, 191, 56),
+            2,
+            cv2.LINE_AA,
+        )
+        return frame
+
     # 打开摄像头的尝试矩阵：按顺序逐个试，第一个出真画面的就用。
     # 排序原则：旧 USB 摄像头惯用的「DSHOW + 强设 720p + 不改格式」放最前，保证老设备零回退；
     # 后面几项专为 4K UVC 直播摄像机（如海康 DS-UVC-U168R）兜底——
@@ -505,7 +551,9 @@ class ToolDetectionApp:
     def _reset_frame_state(self):
         """清掉上一轮残留的帧/框，避免新一轮开头闪到旧画面。"""
         self._last_boxes = []
+        self._box_store = {}
         self._last_annotated = None
+        self._camera_signal_lost = False
         with self._frame_lock:
             self._latest_frame = None
             self._display_frame = None
@@ -709,13 +757,46 @@ class ToolDetectionApp:
         # 诊断计数（读帧帧率）
         diag_t0 = time.time()
         diag_frames = 0
+        bad_frames = 0
+        last_bad_diag = 0.0
         while self.running and self.cap is not None:
             ret, frame = self.cap.read()
-            if not ret:
+            if not ret or frame is None:
                 if self.is_video_file:
                     break          # 视频放完 → 退出循环，自动停止
+                bad_frames += 1
+                if bad_frames >= BAD_FRAME_LIMIT:
+                    self._camera_signal_lost = True
+                    self._clear_realtime_detection_state()
+                    with self._frame_lock:
+                        self._display_frame = self._signal_lost_frame()
+                        self._display_id += 1
+                    now_bad = time.time()
+                    if now_bad - last_bad_diag >= 2.0:
+                        diag(f"摄像头读帧失败连续 {bad_frames} 次：已清理旧框，等待恢复")
+                        last_bad_diag = now_bad
                 time.sleep(0.05)   # 摄像头偶发读帧失败 → 重试
                 continue
+
+            if not self.is_video_file and self._is_blank_frame(frame):
+                bad_frames += 1
+                if bad_frames >= BAD_FRAME_LIMIT:
+                    self._camera_signal_lost = True
+                    self._clear_realtime_detection_state()
+                    with self._frame_lock:
+                        self._display_frame = self._signal_lost_frame(frame)
+                        self._display_id += 1
+                    now_bad = time.time()
+                    if now_bad - last_bad_diag >= 2.0:
+                        diag(f"摄像头输出黑帧连续 {bad_frames} 次：已清理旧框，等待恢复")
+                        last_bad_diag = now_bad
+                time.sleep(0.05)
+                continue
+
+            if bad_frames >= BAD_FRAME_LIMIT or self._camera_signal_lost:
+                diag("摄像头画面已恢复")
+            bad_frames = 0
+            self._camera_signal_lost = False
 
             now = time.time()
             diag_frames += 1
@@ -782,6 +863,14 @@ class ToolDetectionApp:
             self._show_frame(frame)
             self._last_shown_id = did
 
+        if self._camera_signal_lost:
+            if now - self._last_ui_refresh >= 1.0:
+                self.refresh_visible_list()
+                self._last_ui_refresh = now
+            self.stats_label.config(text="摄像头无画面，正在重试...", fg=C_AMBER)
+            self.root.after(15, self._ui_pump)
+            return
+
         # 列表刷新：识别集合变化就刷（节流 1s），否则每 UI_REFRESH_INTERVAL 兜底
         recog_now = frozenset(n for n, t in list(self.last_seen.items())
                               if now - t < VISIBILITY_WINDOW)
@@ -845,7 +934,7 @@ class ToolDetectionApp:
                 continue
             with self._frame_lock:
                 frame = None if self._latest_frame is None else self._latest_frame.copy()
-            if frame is None:
+            if frame is None or self._camera_signal_lost:
                 time.sleep(0.01)
                 continue
             last_detect = now
@@ -861,6 +950,10 @@ class ToolDetectionApp:
             except Exception as e:
                 diag(f"检测出错: {e}")
                 detected, counts = set(), {}
+            if self._camera_signal_lost:
+                self._last_boxes = []
+                self._last_annotated = None
+                continue
             diag_infer_ms += (time.time() - t_infer) * 1000
             diag_infers += 1
 

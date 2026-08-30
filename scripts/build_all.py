@@ -1,4 +1,4 @@
-"""一键出包：PyInstaller 打包 + Inno Setup 封装 Setup.exe（两步合一）。
+r"""一键出包：PyInstaller 打包 + Inno Setup 封装 Setup.exe（两步合一）。
 
 用法：
     python scripts/build_all.py              # 正式版（无黑窗）

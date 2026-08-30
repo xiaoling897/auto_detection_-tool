@@ -1,4 +1,4 @@
-"""把 dist\智能工具检测系统\ 编译成一个 Setup.exe 安装程序（用 Inno Setup）。
+r"""把 dist\智能工具检测系统\ 编译成一个 Setup.exe 安装程序（用 Inno Setup）。
 
 完整出包流程（两步）：
     python scripts/build_exe.py          # 1. PyInstaller 打出 dist\智能工具检测系统\
