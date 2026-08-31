@@ -33,16 +33,14 @@ from .voice import VoiceReporter
 
 UI_REFRESH_INTERVAL = 3.0   # 列表 UI 刷新节奏
 DETECT_INTERVAL = 0.4       # 检测限频：每 N 秒推理一次（其余时间只读帧+叠最近的框，保证视频顺）
-SPEAK_INTERVAL = 8.0        # 兼容旧测试脚本；当前播报按缺失状态变化即时触发
 VISIBILITY_WINDOW = 3.0     # 工具可见性窗口（去抖）：最近 N 秒内识别到就算"在"。
                             # 设大一点能吸收"检测抖动 + 伸手遮挡"导致的瞬时漏检，
                             # 避免拿走一个工具时把旁边被手挡住的工具误报成缺失。
                             # 太小→误报缺失；太大→真拿走后要等更久才报。同时影响列表/框/语音。
+SPEAK_INTERVAL = 8.0        # 语音播报间隔
 BAD_FRAME_LIMIT = 3         # 摄像头连续坏帧达到这个次数后，清掉旧框和旧识别结果
 BLANK_MEAN_THRESHOLD = 6.0  # 接近全黑的平均亮度阈值
 BLANK_STD_THRESHOLD = 4.0   # 接近纯色黑屏的纹理/方差阈值
-CAMERA_OPEN_TIMEOUT = 10.0  # 打开摄像头总超时，避免后端探测卡住后界面一直停在"正在打开"
-CAMERA_ATTEMPT_BUDGET = 1.6 # 单个后端/格式组合的预热预算
 
 # ---- 配色（统一暗色主题，集中放这里方便整体换肤）----
 C_BG = "#0f1629"            # 窗口主背景（深海军蓝）
@@ -136,9 +134,6 @@ class ToolDetectionApp:
         self.should_speak = False
         self.opening_camera = False
         self._camera_open_token = 0
-        self._camera_open_deadline = None
-        self._run_token = 0
-        self._last_camera_attempt = None
         self.last_seen = {}      # 工具名 -> 上次识别到的时间戳
         self.last_counts = {}    # 工具名 -> 上一帧 RANSAC 内点数
         self.last_source = {}    # 工具名 -> 上一帧命中来源（"强"/"弱"/"色"）
@@ -155,15 +150,13 @@ class ToolDetectionApp:
         self._display_frame = None       # 叠好框的"待显示帧"，由主线程 _ui_pump 取去画（共享）
         self._display_id = 0             # 待显示帧的版本号，主线程据此判断是否有新帧
         self._frame_lock = threading.Lock()
-        self._cap_lock = threading.Lock()
         self._infer_running = False      # 推理线程开关
         # 主线程 UI 泵的状态
         self._last_shown_id = -1
         self._last_recog = None
         self._last_ui_refresh = 0.0
+        self._last_speak = 0.0
         self._camera_signal_lost = False
-        self._has_detection_sample = False
-        self._last_announced_missing = None
 
         diag("=" * 50)
         diag(f"启动诊断：后端={'YOLO' if self.use_yolo else 'SIFT(回退)'}, "
@@ -411,8 +404,6 @@ class ToolDetectionApp:
         self._last_annotated = None
         self._last_recog = None
         self._last_ui_refresh = 0.0
-        self._has_detection_sample = False
-        self._last_announced_missing = None
         with self._frame_lock:
             self._latest_frame = None
 
@@ -451,24 +442,7 @@ class ToolDetectionApp:
         (cv2.CAP_DSHOW, "DSHOW", False, False),
     ]
 
-    def _is_camera_open_active(self, token=None, deadline=None):
-        """后台开摄像头时使用：token 过期或超时就停止继续探测。"""
-        if token is not None and token != self._camera_open_token:
-            return False
-        if not self.opening_camera:
-            return False
-        return deadline is None or time.time() < deadline
-
-    def _try_open(
-        self,
-        index,
-        flag,
-        force_720p,
-        use_mjpg,
-        warmup_frames,
-        budget=CAMERA_ATTEMPT_BUDGET,
-        should_continue=None,
-    ):
+    def _try_open(self, index, flag, force_720p, use_mjpg, warmup_frames, budget=2.5):
         """按指定后端/分辨率/格式打开一次，预热读帧判断是否有真画面。
 
         返回 (cap 或 None, opened)：
@@ -482,15 +456,10 @@ class ToolDetectionApp:
         一次尝试能干等 9~13s，6 个组合叠起来就是「点了检测半天不出画面」。加预算后
         每次尝试最多卡 ~budget 秒就放弃，占用场景从一分多钟降到十几秒并能明确提示。
         """
-        if should_continue is not None and not should_continue():
-            return None, False
         cap = cv2.VideoCapture(index, flag)
         if not cap.isOpened():
             cap.release()
             return None, False
-        if should_continue is not None and not should_continue():
-            cap.release()
-            return None, True
 
         # 关键：分辨率/格式必须在预热读帧之前设好。旧代码先用默认分辨率预热、之后才设 720p，
         # 4K 机就会拿 3840x2160 大帧预热，读帧奇慢——这正是换 4K 摄像头后"卡 + 打不开"的元凶之一。
@@ -511,11 +480,7 @@ class ToolDetectionApp:
 
         deadline = time.time() + budget
         for _ in range(warmup_frames):
-            if should_continue is not None and not should_continue():
-                break
             ret, frame = cap.read()
-            if should_continue is not None and not should_continue():
-                break
             if ret and frame is not None and float(frame.std()) > 6.0:
                 return cap, True
             # 超出时间预算就立即放弃这次尝试——被占用时 read() 会持续读不到真画面，
@@ -527,7 +492,7 @@ class ToolDetectionApp:
         cap.release()
         return None, True
 
-    def _open_camera(self, max_index=2, warmup_frames=6, token=None, deadline=None):
+    def _open_camera(self, max_index=2, warmup_frames=8):
         """打开一个可用摄像头，返回配置好的 VideoCapture（失败返回 None）。
 
         换摄像头也能用——不写死设备号、不写死后端、不靠单帧判断：
@@ -542,67 +507,31 @@ class ToolDetectionApp:
         # 给 detect_camera 用来决定弹「被占用」还是「没找到摄像头」两种不同提示。
         self._cam_fail_reason = None
         busy_any = False
-        deadline = deadline or (time.time() + CAMERA_OPEN_TIMEOUT)
-        should_continue = lambda: self._is_camera_open_active(token, deadline)
-        index_order = list(range(max_index + 1))
-        if self._last_camera_attempt is not None:
-            last_index = self._last_camera_attempt[0]
-            index_order = [last_index] + [i for i in index_order if i != last_index]
-
-        for index in index_order:
-            if not should_continue():
-                self._cam_fail_reason = "timeout"
-                diag(f"摄像头探测：超过 {CAMERA_OPEN_TIMEOUT:.0f}s，取消剩余探测")
-                return None
+        for index in range(max_index + 1):
             opened_any = False
-            attempts = list(self._CAM_ATTEMPTS)
-            if self._last_camera_attempt is not None and index == self._last_camera_attempt[0]:
-                _, last_flag, last_bname, last_force_720p, last_use_mjpg = self._last_camera_attempt
-                last_attempt = (last_flag, last_bname, last_force_720p, last_use_mjpg)
-                attempts = [last_attempt] + [a for a in attempts if a != last_attempt]
-
-            for flag, bname, force_720p, use_mjpg in attempts:
-                if not should_continue():
-                    self._cam_fail_reason = "timeout"
-                    diag(f"摄像头探测：超过 {CAMERA_OPEN_TIMEOUT:.0f}s，取消剩余探测")
-                    return None
-                t_attempt = time.time()
-                res = f"{'720p' if force_720p else 'native'}/{'MJPG' if use_mjpg else '默认'}"
-                diag(f"摄像头探测：准备尝试 设备{index} {bname} {res}")
-                remaining = max(0.1, deadline - time.time())
-                budget = min(CAMERA_ATTEMPT_BUDGET, remaining)
-                cap, opened = self._try_open(
-                    index, flag, force_720p, use_mjpg, warmup_frames,
-                    budget=budget, should_continue=should_continue)
+            for flag, bname, force_720p, use_mjpg in self._CAM_ATTEMPTS:
+                cap, opened = self._try_open(index, flag, force_720p, use_mjpg, warmup_frames)
                 opened_any = opened_any or opened
-                elapsed_ms = int((time.time() - t_attempt) * 1000)
-                if not should_continue():
-                    if cap is not None:
-                        cap.release()
-                    self._cam_fail_reason = "timeout"
-                    diag(f"摄像头探测：设备{index} {bname} {res} 超时/取消，耗时 {elapsed_ms}ms")
-                    return None
+                res = f"{'720p' if force_720p else 'native'}/{'MJPG' if use_mjpg else '默认'}"
                 if cap is not None:
                     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                    self._last_camera_attempt = (index, flag, bname, force_720p, use_mjpg)
-                    diag(f"摄像头探测：设备{index} {bname} {res} → ✅ 打开成功 {w}x{h}，耗时 {elapsed_ms}ms")
+                    diag(f"摄像头探测：设备{index} {bname} {res} → ✅ 打开成功 {w}x{h}")
                     return cap
                 # 失败也记日志（写进 run_diag.txt），方便在接了摄像头那台机器远程定位卡在哪
                 if opened:
                     busy_any = True   # 能打开但读不到真画面 → 设备存在，多半是被占用/格式不出流
                 why = "连打开都失败" if not opened else "能打开但读不到真画面(忙/格式不出流)"
-                diag(f"摄像头探测：设备{index} {bname} {res} → ✗ {why}，耗时 {elapsed_ms}ms")
-            # 0 号不一定是真摄像头：外接 USB/采集卡/虚拟摄像头常被 Windows 排到 1 或 2。
-            # 旧逻辑在 0 号全失败后直接放弃，会导致"相机正常但程序打不开"。
+                diag(f"摄像头探测：设备{index} {bname} {res} → ✗ {why}")
+            # 0 号所有后端都打不开 → 基本无摄像头，立即放弃，避免后续设备号的 7-9s 空卡
             if index == 0 and not opened_any:
-                diag("摄像头探测：0号所有后端都打不开 → 继续尝试其它设备号")
-                continue
-            # 0 号能打开、但每种后端/格式都读不到真画面，可能是被占用，也可能只是一个坏的虚拟设备。
-            # 继续试 1/2 号；总超时会兜住慢探测，不再让界面卡几十秒。
+                diag("摄像头探测：0号所有后端都打不开 → 判定无摄像头子系统，停止探测")
+                break
+            # 0 号能打开、但每种后端/格式都读不到真画面 → 极可能被别的程序(oCam/微信/浏览器/相机)
+            # 独占了。再往后探设备 1/2 也大概率同样被占，没必要白等，直接停下给「被占用」提示。
             if index == 0 and busy_any:
-                diag("摄像头探测：0号能打开但读不到画面 → 继续尝试其它设备号")
-                continue
+                diag("摄像头探测：0号能打开但全程读不到画面 → 疑似被其它程序占用，停止探测")
+                break
 
         if busy_any:
             self._cam_fail_reason = "busy"
@@ -627,15 +556,6 @@ class ToolDetectionApp:
             return False
         return True
 
-    def _next_run_token(self):
-        """生成新一轮检测的 token；旧线程看到 token 不匹配就自行退出。"""
-        self._run_token += 1
-        return self._run_token
-
-    def _is_run_active(self, run_token):
-        """判断某个后台回调是否仍属于当前这轮检测。"""
-        return self.running and run_token == self._run_token
-
     def _reset_frame_state(self):
         """清掉上一轮残留的帧/框，避免新一轮开头闪到旧画面。"""
         self._last_boxes = []
@@ -648,16 +568,14 @@ class ToolDetectionApp:
 
     def _begin_realtime(self, status_text):
         """启动实时模式（摄像头/视频共用）：读帧线程 + 主线程 UI 泵。"""
-        run_token = self._next_run_token()
         self.running = True
         self.should_speak = True
         self._reset_frame_state()
         self._set_buttons_running(True)
         self.stats_label.config(text=status_text, fg=C_GREEN)
-        self.detection_thread = threading.Thread(
-            target=self.detection_loop, args=(run_token,), daemon=True)
+        self.detection_thread = threading.Thread(target=self.detection_loop, daemon=True)
         self.detection_thread.start()
-        self._start_ui_pump(run_token)
+        self._start_ui_pump()
 
     def detect_camera(self):
         """摄像头检测：打开摄像头 → 实时双线程检测。"""
@@ -668,44 +586,23 @@ class ToolDetectionApp:
         if not self._check_ready():
             return
 
-        if self.cap is not None and not self.is_video_file:
-            try:
-                if self.cap.isOpened():
-                    diag("摄像头复用：使用已打开的摄像头句柄，跳过重新探测")
-                    self.use_camera = True
-                    self.is_video_file = False
-                    self.static_frame = None
-                    self._begin_realtime("正在检测（摄像头实时）…")
-                    return
-            except Exception:
-                try:
-                    self.cap.release()
-                except Exception:
-                    pass
-                self.cap = None
-
         self.opening_camera = True
         self._camera_open_token += 1
         token = self._camera_open_token
-        deadline = time.time() + CAMERA_OPEN_TIMEOUT
-        self._camera_open_deadline = deadline
         self.use_camera = True
         self.is_video_file = False
         self.static_frame = None
         self._reset_frame_state()
         self._set_buttons_running(True)
-        self.video_label.configure(
-            image="", text=f"📷  正在打开摄像头...（最多 {CAMERA_OPEN_TIMEOUT:.0f} 秒）")
+        self.video_label.configure(image="", text="📷  正在打开摄像头...")
         self.video_label.imgtk = None
-        self.stats_label.config(
-            text=f"正在打开摄像头...（最多 {CAMERA_OPEN_TIMEOUT:.0f} 秒）", fg=C_AMBER)
-        self.root.after(int(CAMERA_OPEN_TIMEOUT * 1000), lambda: self._on_camera_open_timeout(token))
-        threading.Thread(target=self._open_camera_worker, args=(token, deadline), daemon=True).start()
+        self.stats_label.config(text="正在打开摄像头...", fg=C_AMBER)
+        threading.Thread(target=self._open_camera_worker, args=(token,), daemon=True).start()
 
-    def _open_camera_worker(self, token, deadline=None):
+    def _open_camera_worker(self, token):
         """后台打开摄像头，避免 OpenCV 探测阻塞 Tk 主线程。"""
         try:
-            cap = self._open_camera(token=token, deadline=deadline)
+            cap = self._open_camera()
             error = None
         except Exception as e:
             cap = None
@@ -716,25 +613,6 @@ class ToolDetectionApp:
             if cap is not None:
                 cap.release()
 
-    def _on_camera_open_timeout(self, token):
-        """打开摄像头超时：取消本次打开请求，避免界面一直停在打开中。"""
-        if token != self._camera_open_token or not self.opening_camera:
-            return
-        self.opening_camera = False
-        self._camera_open_token += 1
-        self._camera_open_deadline = None
-        self._cam_fail_reason = "timeout"
-        self._set_buttons_running(False)
-        self.video_label.configure(image="", text="📷  点击下方按钮开始检测")
-        self.video_label.imgtk = None
-        self.stats_label.config(text="摄像头打开超时", fg="#ff6b6b")
-        diag(f"摄像头探测：超过 {CAMERA_OPEN_TIMEOUT:.0f}s 未完成，已取消本次打开")
-        messagebox.showwarning(
-            "摄像头打开超时",
-            f"打开摄像头超过 {CAMERA_OPEN_TIMEOUT:.0f} 秒，已取消本次操作。\n\n"
-            "请先确认摄像头没有被 oCam、微信/QQ 视频、浏览器页面或 Windows 相机占用，"
-            "再重新点击「📷 摄像头检测」。")
-
     def _on_camera_opened(self, token, cap, error=None):
         """摄像头打开结果回到主线程处理。"""
         if token != self._camera_open_token or not self.opening_camera:
@@ -743,7 +621,6 @@ class ToolDetectionApp:
             return
 
         self.opening_camera = False
-        self._camera_open_deadline = None
         if error is not None:
             if cap is not None:
                 cap.release()
@@ -756,16 +633,8 @@ class ToolDetectionApp:
             self._set_buttons_running(False)
             self.video_label.configure(image="", text="📷  点击下方按钮开始检测")
             self.video_label.imgtk = None
-            fail_reason = getattr(self, "_cam_fail_reason", None)
-            if fail_reason == "timeout":
-                self.stats_label.config(text="摄像头打开超时", fg="#ff6b6b")
-                messagebox.showwarning(
-                    "摄像头打开超时",
-                    f"打开摄像头超过 {CAMERA_OPEN_TIMEOUT:.0f} 秒，已取消本次操作。\n\n"
-                    "请先确认摄像头没有被 oCam、微信/QQ 视频、浏览器页面或 Windows 相机占用，"
-                    "再重新点击「📷 摄像头检测」。")
-            elif fail_reason == "busy":
-                self.stats_label.config(text="摄像头不可用", fg="#ff6b6b")
+            self.stats_label.config(text="摄像头不可用", fg="#ff6b6b")
+            if getattr(self, "_cam_fail_reason", None) == "busy":
                 # 能打开但读不到画面 = 设备在、被独占。明确告诉用户关掉占用程序，别让他以为是程序坏了。
                 messagebox.showwarning(
                     "摄像头被占用",
@@ -777,7 +646,6 @@ class ToolDetectionApp:
                     "  • Windows「相机」App\n\n"
                     "关掉后再点「📷 摄像头检测」即可秒开；也可改用「🎬 视频检测」「🖼 图片检测」。")
             else:
-                self.stats_label.config(text="摄像头不可用", fg="#ff6b6b")
                 messagebox.showwarning(
                     "未找到摄像头",
                     "没有检测到可用摄像头。\n请检查摄像头是否插好，"
@@ -794,9 +662,6 @@ class ToolDetectionApp:
         """图片检测：选一张图片 → 检测一次。"""
         if self.running:
             self.stop_detection()
-        if self.cap is not None and self.use_camera and not self.is_video_file:
-            self.cap.release()
-            self.cap = None
         if not self._check_ready():
             return
         initial_dir = str(DATA_DIR / "samples")
@@ -818,14 +683,12 @@ class ToolDetectionApp:
 
         self.use_camera = False
         self.is_video_file = False
-        run_token = self._next_run_token()
         self.running = True
         self.should_speak = True
         self._reset_frame_state()
         self._set_buttons_running(True)
         self.stats_label.config(text="检测图片中…", fg=C_AMBER)
-        self.detection_thread = threading.Thread(
-            target=self.detection_loop, args=(run_token,), daemon=True)
+        self.detection_thread = threading.Thread(target=self.detection_loop, daemon=True)
         self.detection_thread.start()   # 静态图一次性显示，不需要 UI 泵
 
     def open_video(self):
@@ -836,9 +699,6 @@ class ToolDetectionApp:
         """
         if self.running:
             self.stop_detection()
-        if self.cap is not None and self.use_camera and not self.is_video_file:
-            self.cap.release()
-            self.cap = None
         if not self._check_ready():
             return
 
@@ -873,17 +733,13 @@ class ToolDetectionApp:
         was_signal_lost = self._camera_signal_lost
         self.opening_camera = False
         self._camera_open_token += 1
-        self._camera_open_deadline = None
-        self._next_run_token()
         self.running = False
         self.should_speak = False
         self._infer_running = False   # 停掉后台推理线程
         self._camera_signal_lost = False
         self.voice.stop()             # 立刻打断正在念的语音（不管念没念完）
 
-        keep_camera_ready = (self.use_camera and not self.is_video_file
-                             and self.cap is not None and not was_signal_lost)
-        if self.cap is not None and not keep_camera_ready:
+        if self.cap is not None:
             cap = self.cap
             self.cap = None
             cap.release()
@@ -913,8 +769,6 @@ class ToolDetectionApp:
         self.last_counts = {}
         self._last_boxes = []
         self._last_annotated = None
-        self._has_detection_sample = False
-        self._last_announced_missing = None
         try:
             self.refresh_visible_list()
             self.video_label.configure(image="", text="📷  点击下方按钮开始检测")
@@ -934,38 +788,28 @@ class ToolDetectionApp:
         self.video_label.imgtk = imgtk
         self.video_label.configure(image=imgtk)
 
-    def detection_loop(self, run_token=None):
-        if run_token is None:
-            run_token = self._run_token
-        if not self._is_run_active(run_token):
-            return
+    def detection_loop(self):
         try:
             if self.use_camera:
-                self._camera_loop(run_token)
+                self._camera_loop()
             else:
-                self._static_once(run_token)
+                self._static_once()
         except Exception as e:
-            if self._is_run_active(run_token):
-                print(f"检测出错: {e}")
-                self.stop_detection()
-            else:
-                diag(f"旧检测线程退出时忽略异常：{e}")
+            print(f"检测出错: {e}")
+            self.stop_detection()
 
-    def _start_ui_pump(self, run_token=None):
+    def _start_ui_pump(self):
         """复位 UI 泵状态并在主线程启动它（由主线程的按钮回调调用）。"""
-        if run_token is None:
-            run_token = self._run_token
         self._last_shown_id = -1
         self._last_recog = None
         self._last_ui_refresh = 0.0
-        self._has_detection_sample = False
-        self._last_announced_missing = None
+        self._last_speak = time.time()   # 首次播报推迟 SPEAK_INTERVAL，别一打开就念一堆
         with self._frame_lock:
             self._display_frame = None
             self._display_id = 0
-        self.root.after(0, lambda: self._ui_pump(run_token))
+        self.root.after(0, self._ui_pump)
 
-    def _camera_loop(self, run_token=None):
+    def _camera_loop(self):
         """读帧线程：持续读帧 → 叠最近的框（纯 cv2，不碰 Tkinter）→ 存成待显示帧。
 
         三方分工：本线程只读帧+叠框（不碰 Tkinter）；_inference_worker 后台跑推理回写框；
@@ -973,13 +817,10 @@ class ToolDetectionApp:
         框常驻：每帧把推理线程最新回写的 _last_boxes 叠上（render_live 缓存贴图，几乎零开销），
         所以框跟着实时画面、不闪。
         """
-        if run_token is None:
-            run_token = self._run_token
         self._box_store = {}  # 清掉上一轮的框存活记录
         # 启动后台推理线程
         self._infer_running = True
-        worker = threading.Thread(
-            target=self._inference_worker, args=(run_token,), daemon=True)
+        worker = threading.Thread(target=self._inference_worker, daemon=True)
         worker.start()
 
         # 视频文件：按原生帧率播放（否则读多快放多快，一闪而过）
@@ -991,15 +832,12 @@ class ToolDetectionApp:
         diag_frames = 0
         bad_frames = 0
         last_bad_diag = 0.0
-        while self._is_run_active(run_token) and self.cap is not None:
+        while self.running and self.cap is not None:
             cap = self.cap
             if cap is None:
                 break
-            with self._cap_lock:
-                if not self._is_run_active(run_token) or self.cap is not cap:
-                    break
-                ret, frame = cap.read()
-            if not self._is_run_active(run_token) or self.cap is None:
+            ret, frame = cap.read()
+            if not self.running or self.cap is None:
                 break
             if not ret or frame is None:
                 if self.is_video_file:
@@ -1043,8 +881,6 @@ class ToolDetectionApp:
 
             # 把最新帧交给推理线程（只存引用，worker 取用时自己 copy）
             with self._frame_lock:
-                if not self._is_run_active(run_token):
-                    break
                 self._latest_frame = frame
 
             # 叠框（纯 cv2/numpy，不碰 Tkinter）。每帧把推理线程最新回写的框叠上 → 框常驻不闪
@@ -1057,8 +893,6 @@ class ToolDetectionApp:
             # 存成"待显示帧"，交给主线程 _ui_pump 去画。绝不在这个后台线程里调 Tkinter——
             # 后台线程直接建 PhotoImage/configure 会和主线程重绘抢，导致画面间歇性闪黑。
             with self._frame_lock:
-                if not self._is_run_active(run_token):
-                    break
                 self._display_frame = display
                 self._display_id += 1
 
@@ -1083,22 +917,19 @@ class ToolDetectionApp:
                 time.sleep(0.01)
 
         # 读帧线程退出 → 通知推理线程收尾
-        if run_token == self._run_token:
-            self._infer_running = False
+        self._infer_running = False
 
         # 视频自然放完（非手动停止）→ 回主线程复位按钮与状态
-        if self.is_video_file and self._is_run_active(run_token):
-            self.root.after(0, lambda: self._on_video_finished(run_token))
+        if self.is_video_file and self.running:
+            self.root.after(0, self._on_video_finished)
 
-    def _ui_pump(self, run_token=None):
+    def _ui_pump(self):
         """主线程 UI 泵：定时取最新"待显示帧"来画 + 刷列表 + 触发语音。
 
         所有 Tkinter 操作都在这里（主线程）完成，跟 mainloop 重绘同步，
         避免后台线程直接画图导致的黑屏闪烁。running=False 时自动停止重调度。
         """
-        if run_token is None:
-            run_token = self._run_token
-        if not self._is_run_active(run_token):
+        if not self.running:
             return
         now = time.time()
 
@@ -1115,7 +946,7 @@ class ToolDetectionApp:
                 self.refresh_visible_list()
                 self._last_ui_refresh = now
             self.stats_label.config(text="摄像头无画面，正在重试...", fg=C_AMBER)
-            self.root.after(15, lambda: self._ui_pump(run_token))
+            self.root.after(15, self._ui_pump)
             return
 
         # 列表刷新：识别集合变化就刷（节流 1s），否则每 UI_REFRESH_INTERVAL 兜底
@@ -1127,18 +958,16 @@ class ToolDetectionApp:
             self._last_ui_refresh = now
             self._last_recog = recog_now
 
-        # 缺失状态一变化就播报。先等到至少完成过一次推理，避免刚打开摄像头时误报全缺。
-        if self.should_speak and self._has_detection_sample:
-            self._announce_missing_if_changed(now)
+        # 语音播报（report 非阻塞，瞬间返回）
+        if self.should_speak and now - self._last_speak >= SPEAK_INTERVAL:
+            self.speak_missing()
+            self._last_speak = now
 
-        self.root.after(15, lambda: self._ui_pump(run_token))   # ~每 15ms 一次，跟随主循环重绘
+        self.root.after(15, self._ui_pump)   # ~每 15ms 一次，跟随主循环重绘
 
-    def _on_video_finished(self, run_token=None):
+    def _on_video_finished(self):
         """视频播放结束后在主线程里复位 UI（手动停止不走这里）。"""
-        if run_token is not None and run_token != self._run_token:
-            return
         self.running = False
-        self._next_run_token()
         if self.cap is not None:
             self.cap.release()
             self.cap = None
@@ -1166,19 +995,17 @@ class ToolDetectionApp:
                 del self._box_store[name]       # 过期 → 框消失
         return held
 
-    def _inference_worker(self, run_token=None):
+    def _inference_worker(self):
         """后台推理线程：每 DETECT_INTERVAL 取一次最新帧跑 YOLO/SIFT，
         只回写 _last_boxes / last_seen / last_counts，不碰 Tkinter（线程安全）。
 
         与显示线程解耦：推理慢只拖慢"框刷新率"，绝不阻塞显示线程读帧/显示。
         """
-        if run_token is None:
-            run_token = self._run_token
         last_detect = 0.0
         diag_t0 = time.time()
         diag_infer_ms = 0.0
         diag_infers = 0
-        while self._infer_running and self._is_run_active(run_token):
+        while self._infer_running and self.running:
             now = time.time()
             if now - last_detect < DETECT_INTERVAL:
                 time.sleep(0.01)
@@ -1194,22 +1021,17 @@ class ToolDetectionApp:
             try:
                 if self.use_yolo:
                     detected, counts, boxes = self.detector_engine.infer(frame)
-                    annotated = None
+                    self._last_boxes = self._hold_boxes(boxes)
                 else:
                     detected, annotated, counts = self.detector_engine.detect(frame)
+                    self._last_annotated = annotated
             except Exception as e:
                 diag(f"检测出错: {e}")
-                detected, counts, boxes, annotated = set(), {}, [], None
-            if not self._is_run_active(run_token):
-                break
+                detected, counts = set(), {}
             if self._camera_signal_lost:
                 self._last_boxes = []
                 self._last_annotated = None
                 continue
-            if self.use_yolo:
-                self._last_boxes = self._hold_boxes(boxes)
-            else:
-                self._last_annotated = annotated
             diag_infer_ms += (time.time() - t_infer) * 1000
             diag_infers += 1
 
@@ -1217,7 +1039,6 @@ class ToolDetectionApp:
             for name in detected:
                 self.last_seen[name] = stamp
             self.last_counts.update(counts)
-            self._has_detection_sample = True
             self.last_source = dict(getattr(self.detector_engine, "last_source", {}))
             self.detect_threshold = getattr(self.detector_engine, "last_threshold", 0)
             hits = " ".join(
@@ -1232,14 +1053,9 @@ class ToolDetectionApp:
                 diag_infer_ms = 0.0
                 diag_infers = 0
 
-    def _static_once(self, run_token=None):
-        if run_token is None:
-            run_token = self._run_token
+    def _static_once(self):
         now = time.time()
         detected, display, counts = self.detector_engine.detect(self.static_frame)
-        if not self._is_run_active(run_token):
-            return
-        self._has_detection_sample = True
         for name in detected:
             self.last_seen[name] = now
         self.last_counts.update(counts)
@@ -1248,12 +1064,9 @@ class ToolDetectionApp:
         self._show_frame(display)
         recognized_count = self.refresh_visible_list()
         if self.should_speak:
-            self._announce_missing_if_changed(now)
+            self.speak_missing()
 
-        if not self._is_run_active(run_token):
-            return
         self.running = False
-        self._next_run_token()
         try:
             self._set_buttons_running(False)
             total = len(self._valid_tools())
@@ -1267,48 +1080,16 @@ class ToolDetectionApp:
 
     # ---------------- 语音 ----------------
 
-    def _current_missing(self, now=None):
-        """根据可见性窗口计算当前缺失集合。"""
+    def speak_missing(self):
+        """播报当前还缺失的工具（基于可见性窗口）"""
         all_tools = set(t["name"] for t in self._valid_tools())
-        now = time.time() if now is None else now
+        now = time.time()
         currently_visible = {
             name for name, t in self.last_seen.items()
             if now - t < VISIBILITY_WINDOW
         }
-        return all_tools - currently_visible
-
-    def _announce_missing_if_changed(self, now=None):
-        """缺失集合发生变化时立即播报，避免固定 8 秒轮询的延迟。"""
-        missing = frozenset(self._current_missing(now))
-        previous = self._last_announced_missing
-        if missing == previous:
-            return
-        self._last_announced_missing = missing
-
-        if previous is None:
-            messages = ["工具齐全"] if not missing else [f"{name}缺失" for name in sorted(missing)]
-        else:
-            newly_missing = sorted(missing - previous)
-            restored = sorted(previous - missing)
-            messages = []
-            if restored:
-                messages.append("、".join(restored) + "已放回")
-            messages.extend(f"{name}缺失" for name in newly_missing)
-            if restored and not missing:
-                messages.append("工具齐全")
-            elif restored and missing:
-                messages.append("仍缺失：" + "、".join(sorted(missing)))
-
-        if hasattr(self.voice, "say"):
-            self.voice.say(messages)
-        else:
-            self.voice.report(sorted(missing))
-        msg = "工具齐全" if not missing else "缺失：" + "、".join(sorted(missing))
-        diag(f"语音播报：{msg}")
-
-    def speak_missing(self):
-        """播报当前还缺失的工具（基于可见性窗口）"""
-        self.voice.report(sorted(self._current_missing()))
+        missing = all_tools - currently_visible
+        self.voice.report(missing)
 
 
 def main():
