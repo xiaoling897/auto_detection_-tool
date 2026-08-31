@@ -7,12 +7,17 @@
 """
 import json
 import os
+import time
 
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-CONFIDENCE_THRESHOLD = 0.25   # YOLO 输出置信度阈值（降低让弱检测也通过）
+CONFIDENCE_THRESHOLD = 0.55   # YOLO 置信度阈值（偏准确）。误检多往上调、漏检多往下调。
+                              # 注："静态画面识别不全"不是阈值问题（降到 0.45 也没改善）——
+                              # 是那几件工具在某个固定角度下模型置信度极低，要靠 TTA/补数据解决。
+TTA_ENABLED = False           # 测试时增强：多尺度+翻转推理提召回。实测对"某角度大物体漏检"无效（是数据问题），
+                              # 且慢 2-3 倍，故默认关。想要更高召回可改 True。
 IOU_THRESHOLD = 0.45          # NMS 阈值
 
 # Windows 中文字体路径（cv2.putText 不支持中文，得走 PIL）
@@ -42,6 +47,17 @@ class YoloToolDetector:
         # 只在真正构造检测器时才付出代价
         from ultralytics import YOLO
 
+        # 限制 torch 推理线程数：默认 torch 会吃满所有 CPU 核，导致 GUI 的采集/显示线程
+        # 抢不到 CPU，摄像头画面卡顿。留 2 个核给界面与摄像头采集（至少留 1 个），
+        # 纯 CPU 机器上视频明显更顺——代价是单次推理略慢，但检测仍是实时几帧/秒。
+        try:
+            import torch
+            n_cpu = os.cpu_count() or 4
+            torch.set_num_threads(max(1, n_cpu - 2))
+            print(f"🧵 torch 推理线程数限制为 {max(1, n_cpu - 2)}（共 {n_cpu} 核，留核给界面）")
+        except Exception as e:
+            print(f"设置 torch 线程数失败（忽略）: {e}")
+
         self.model = YOLO(model_path)
         self.confidence_threshold = conf if conf is not None else CONFIDENCE_THRESHOLD
 
@@ -55,6 +71,24 @@ class YoloToolDetector:
 
         self._font = self._load_font(20)
         self._font_small = self._load_font(16)
+        self.last_boxes = []   # 最近一次 infer 的框，供实时显示线程复用
+
+        # 预热：YOLO 第一次推理要做一堆延迟初始化（冷启动好几秒）。在这里先空跑一帧，
+        # 把这笔开销提前到启动时付掉——否则"打开视频/摄像头"后第一次检测会卡好几秒才出框
+        # （旧单线程版是靠"第一帧卡住等推理"掩盖了这点；新双线程版视频已在流畅播放，
+        #  冷启动那几秒就暴露成"放了半天不出框"）。
+        try:
+            t0 = time.time()
+            self.model(np.zeros((480, 640, 3), dtype=np.uint8),
+                       conf=self.confidence_threshold, iou=IOU_THRESHOLD, verbose=False)
+            print(f"🔥 YOLO 预热完成（{(time.time() - t0) * 1000:.0f} ms），首次检测即时出框")
+        except Exception as e:
+            print(f"YOLO 预热失败（忽略，不影响功能）: {e}")
+        # 中文标签贴图缓存：label 字符串 -> 预渲染好的小图（BGR）。
+        # 实时显示线程每帧画框，若每帧都做"整幅 cv2<->PIL 转换"画中文，720p 上要十几毫秒，
+        # 会拖慢视频。改成：每个标签只用 PIL 渲染一次成小贴图缓存起来，之后每帧只做一次
+        # numpy 切片贴图（几乎零开销）—— 这是双线程下保证视频顺的关键。
+        self._label_cache = {}
 
     @staticmethod
     def _load_font(size):
@@ -69,25 +103,27 @@ class YoloToolDetector:
         """模型英文类名 → 中文显示名（找不到映射就用原名）"""
         return self.class_map.get(model_name, model_name)
 
-    def detect(self, frame_bgr):
-        """对一帧 BGR 图像跑 YOLO 检测。
+    def infer(self, frame_bgr):
+        """只跑推理，不画图。给实时检测线程用——视频线程不必等画图。
 
         Returns:
-            tuple: (detected_set, display_frame, confidences)
+            tuple: (detected_set, confidences, boxes)
               - detected_set: 检测到的工具中文名集合
-              - display_frame: 标注后的 BGR 画面（带框 + 中文标签）
-              - confidences: {tool_name: 置信度 0-100 整数}——同 SIFT 检测器输出格式，
-                             方便 GUI 不改地复用（之前显示"内点数"的位置现在显示置信度%）
+              - confidences: {tool_name: 置信度 0-100 整数}
+              - boxes: [(x1, y1, x2, y2, cn_name, conf_pct), ...] 供 render 复用
         """
+        # augment=True 开 TTA（测试时增强）：对同一帧跑多尺度+翻转再合并，召回更高。
+        # 解决"静止画面某些工具(万用表/激光测距仪)分数差一点没过线、一动就出来"的问题——
+        # 相当于把"运动带来的多视角"在静态帧上补上。代价：单帧推理慢 2-3 倍（后台线程跑，不卡画面）。
         results = self.model(
             frame_bgr,
             conf=self.confidence_threshold,
             iou=IOU_THRESHOLD,
+            augment=TTA_ENABLED,
             verbose=False,
         )
         result = results[0]
 
-        display = frame_bgr.copy()
         detected = set()
         confidences = {}
         boxes_to_draw = []
@@ -112,6 +148,17 @@ class YoloToolDetector:
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 boxes_to_draw.append((x1, y1, x2, y2, cn_name, int(conf * 100)))
 
+        self.last_boxes = boxes_to_draw
+        return detected, confidences, boxes_to_draw
+
+    def render(self, frame_bgr, boxes_to_draw):
+        """把 boxes 画到帧上，返回标注后的 BGR 帧。
+
+        实时显示线程每帧调用——可复用最近一次 infer 的 boxes，使框在两次检测之间
+        持续显示在实时画面上（固定监控场景里目标基本不动，框位置稳定）。
+        """
+        display = frame_bgr.copy()
+
         # 矩形框用 cv2 画（快）
         for x1, y1, x2, y2, _, _ in boxes_to_draw:
             cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
@@ -128,9 +175,66 @@ class YoloToolDetector:
             display = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
         # 顶部统计（英文，cv2 即可）
+        detected_count = len({b[4] for b in boxes_to_draw})
         total = len(self.class_map) if self.class_map else len(self.model.names)
         cv2.putText(
-            display, f"Tools: {len(detected)}/{total}",
+            display, f"Tools: {detected_count}/{total}",
             (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2,
         )
+        return display
+
+    def _label_sprite(self, text):
+        """把一段中文标签预渲染成小贴图（BGR，黑底绿字），按文本缓存。
+
+        只有遇到没见过的标签字符串才会真正走一次 PIL 渲染；之后命中缓存直接返回，
+        所以实时显示线程每帧叠标签几乎不花 CPU。
+        """
+        cached = self._label_cache.get(text)
+        if cached is not None:
+            return cached
+        dummy = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+        bbox = dummy.textbbox((0, 0), text, font=self._font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        pad = 3
+        img = Image.new("RGB", (tw + 2 * pad, th + 2 * pad), (0, 0, 0))
+        ImageDraw.Draw(img).text(
+            (pad - bbox[0], pad - bbox[1]), text, font=self._font, fill=(0, 255, 0))
+        spr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        self._label_cache[text] = spr
+        return spr
+
+    def render_live(self, frame_bgr, boxes_to_draw):
+        """实时显示专用：cv2 画矩形框 + 贴缓存好的中文标签，每帧开销极小。
+
+        与 render() 的区别：render() 每帧都做整幅 cv2<->PIL 转换（慢），适合静态图；
+        render_live() 用预渲染的标签贴图做 numpy 切片叠加，适合摄像头实时显示线程逐帧调用。
+        直接在传入的 frame_bgr 上就地绘制（调用方自行决定是否先 copy）。
+        """
+        h, w = frame_bgr.shape[:2]
+        for x1, y1, x2, y2, cn_name, conf_pct in boxes_to_draw:
+            cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            spr = self._label_sprite(f"{cn_name} {conf_pct}%")
+            sh, sw = spr.shape[:2]
+            if sw > w or sh > h:
+                continue
+            y = max(0, y1 - sh)
+            x = max(0, min(x1, w - sw))
+            frame_bgr[y:y + sh, x:x + sw] = spr
+
+        detected_count = len({b[4] for b in boxes_to_draw})
+        total = len(self.class_map) if self.class_map else len(self.model.names)
+        cv2.putText(
+            frame_bgr, f"Tools: {detected_count}/{total}",
+            (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2,
+        )
+        return frame_bgr
+
+    def detect(self, frame_bgr):
+        """对一帧 BGR 图像跑 YOLO 检测（推理 + 画图一步到位，静态图/旧接口用）。
+
+        Returns:
+            tuple: (detected_set, display_frame, confidences)——同 SIFT 检测器输出格式。
+        """
+        detected, confidences, boxes = self.infer(frame_bgr)
+        display = self.render(frame_bgr, boxes)
         return detected, display, confidences

@@ -33,6 +33,7 @@ from .voice import VoiceReporter
 
 UI_REFRESH_INTERVAL = 3.0   # 列表 UI 刷新节奏
 DETECT_INTERVAL = 0.4       # 检测限频：每 N 秒推理一次（其余时间只读帧+叠最近的框，保证视频顺）
+SPEAK_INTERVAL = 8.0        # 兼容旧测试脚本；当前播报按缺失状态变化即时触发
 VISIBILITY_WINDOW = 3.0     # 工具可见性窗口（去抖）：最近 N 秒内识别到就算"在"。
                             # 设大一点能吸收"检测抖动 + 伸手遮挡"导致的瞬时漏检，
                             # 避免拿走一个工具时把旁边被手挡住的工具误报成缺失。
@@ -40,6 +41,8 @@ VISIBILITY_WINDOW = 3.0     # 工具可见性窗口（去抖）：最近 N 秒�
 BAD_FRAME_LIMIT = 3         # 摄像头连续坏帧达到这个次数后，清掉旧框和旧识别结果
 BLANK_MEAN_THRESHOLD = 6.0  # 接近全黑的平均亮度阈值
 BLANK_STD_THRESHOLD = 4.0   # 接近纯色黑屏的纹理/方差阈值
+CAMERA_OPEN_TIMEOUT = 10.0  # 打开摄像头总超时，避免后端探测卡住后界面一直停在"正在打开"
+CAMERA_ATTEMPT_BUDGET = 1.6 # 单个后端/格式组合的预热预算
 
 # ---- 配色（统一暗色主题，集中放这里方便整体换肤）----
 C_BG = "#0f1629"            # 窗口主背景（深海军蓝）
@@ -133,6 +136,7 @@ class ToolDetectionApp:
         self.should_speak = False
         self.opening_camera = False
         self._camera_open_token = 0
+        self._camera_open_deadline = None
         self._run_token = 0
         self._last_camera_attempt = None
         self.last_seen = {}      # 工具名 -> 上次识别到的时间戳
@@ -447,7 +451,24 @@ class ToolDetectionApp:
         (cv2.CAP_DSHOW, "DSHOW", False, False),
     ]
 
-    def _try_open(self, index, flag, force_720p, use_mjpg, warmup_frames, budget=2.5):
+    def _is_camera_open_active(self, token=None, deadline=None):
+        """后台开摄像头时使用：token 过期或超时就停止继续探测。"""
+        if token is not None and token != self._camera_open_token:
+            return False
+        if not self.opening_camera:
+            return False
+        return deadline is None or time.time() < deadline
+
+    def _try_open(
+        self,
+        index,
+        flag,
+        force_720p,
+        use_mjpg,
+        warmup_frames,
+        budget=CAMERA_ATTEMPT_BUDGET,
+        should_continue=None,
+    ):
         """按指定后端/分辨率/格式打开一次，预热读帧判断是否有真画面。
 
         返回 (cap 或 None, opened)：
@@ -461,10 +482,15 @@ class ToolDetectionApp:
         一次尝试能干等 9~13s，6 个组合叠起来就是「点了检测半天不出画面」。加预算后
         每次尝试最多卡 ~budget 秒就放弃，占用场景从一分多钟降到十几秒并能明确提示。
         """
+        if should_continue is not None and not should_continue():
+            return None, False
         cap = cv2.VideoCapture(index, flag)
         if not cap.isOpened():
             cap.release()
             return None, False
+        if should_continue is not None and not should_continue():
+            cap.release()
+            return None, True
 
         # 关键：分辨率/格式必须在预热读帧之前设好。旧代码先用默认分辨率预热、之后才设 720p，
         # 4K 机就会拿 3840x2160 大帧预热，读帧奇慢——这正是换 4K 摄像头后"卡 + 打不开"的元凶之一。
@@ -485,7 +511,11 @@ class ToolDetectionApp:
 
         deadline = time.time() + budget
         for _ in range(warmup_frames):
+            if should_continue is not None and not should_continue():
+                break
             ret, frame = cap.read()
+            if should_continue is not None and not should_continue():
+                break
             if ret and frame is not None and float(frame.std()) > 6.0:
                 return cap, True
             # 超出时间预算就立即放弃这次尝试——被占用时 read() 会持续读不到真画面，
@@ -497,7 +527,7 @@ class ToolDetectionApp:
         cap.release()
         return None, True
 
-    def _open_camera(self, max_index=2, warmup_frames=6):
+    def _open_camera(self, max_index=2, warmup_frames=6, token=None, deadline=None):
         """打开一个可用摄像头，返回配置好的 VideoCapture（失败返回 None）。
 
         换摄像头也能用——不写死设备号、不写死后端、不靠单帧判断：
@@ -512,12 +542,18 @@ class ToolDetectionApp:
         # 给 detect_camera 用来决定弹「被占用」还是「没找到摄像头」两种不同提示。
         self._cam_fail_reason = None
         busy_any = False
+        deadline = deadline or (time.time() + CAMERA_OPEN_TIMEOUT)
+        should_continue = lambda: self._is_camera_open_active(token, deadline)
         index_order = list(range(max_index + 1))
         if self._last_camera_attempt is not None:
             last_index = self._last_camera_attempt[0]
             index_order = [last_index] + [i for i in index_order if i != last_index]
 
         for index in index_order:
+            if not should_continue():
+                self._cam_fail_reason = "timeout"
+                diag(f"摄像头探测：超过 {CAMERA_OPEN_TIMEOUT:.0f}s，取消剩余探测")
+                return None
             opened_any = False
             attempts = list(self._CAM_ATTEMPTS)
             if self._last_camera_attempt is not None and index == self._last_camera_attempt[0]:
@@ -526,11 +562,26 @@ class ToolDetectionApp:
                 attempts = [last_attempt] + [a for a in attempts if a != last_attempt]
 
             for flag, bname, force_720p, use_mjpg in attempts:
+                if not should_continue():
+                    self._cam_fail_reason = "timeout"
+                    diag(f"摄像头探测：超过 {CAMERA_OPEN_TIMEOUT:.0f}s，取消剩余探测")
+                    return None
                 t_attempt = time.time()
-                cap, opened = self._try_open(index, flag, force_720p, use_mjpg, warmup_frames)
-                opened_any = opened_any or opened
                 res = f"{'720p' if force_720p else 'native'}/{'MJPG' if use_mjpg else '默认'}"
+                diag(f"摄像头探测：准备尝试 设备{index} {bname} {res}")
+                remaining = max(0.1, deadline - time.time())
+                budget = min(CAMERA_ATTEMPT_BUDGET, remaining)
+                cap, opened = self._try_open(
+                    index, flag, force_720p, use_mjpg, warmup_frames,
+                    budget=budget, should_continue=should_continue)
+                opened_any = opened_any or opened
                 elapsed_ms = int((time.time() - t_attempt) * 1000)
+                if not should_continue():
+                    if cap is not None:
+                        cap.release()
+                    self._cam_fail_reason = "timeout"
+                    diag(f"摄像头探测：设备{index} {bname} {res} 超时/取消，耗时 {elapsed_ms}ms")
+                    return None
                 if cap is not None:
                     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -542,15 +593,16 @@ class ToolDetectionApp:
                     busy_any = True   # 能打开但读不到真画面 → 设备存在，多半是被占用/格式不出流
                 why = "连打开都失败" if not opened else "能打开但读不到真画面(忙/格式不出流)"
                 diag(f"摄像头探测：设备{index} {bname} {res} → ✗ {why}，耗时 {elapsed_ms}ms")
-            # 0 号所有后端都打不开 → 基本无摄像头，立即放弃，避免后续设备号的 7-9s 空卡
+            # 0 号不一定是真摄像头：外接 USB/采集卡/虚拟摄像头常被 Windows 排到 1 或 2。
+            # 旧逻辑在 0 号全失败后直接放弃，会导致"相机正常但程序打不开"。
             if index == 0 and not opened_any:
-                diag("摄像头探测：0号所有后端都打不开 → 判定无摄像头子系统，停止探测")
-                break
-            # 0 号能打开、但每种后端/格式都读不到真画面 → 极可能被别的程序(oCam/微信/浏览器/相机)
-            # 独占了。再往后探设备 1/2 也大概率同样被占，没必要白等，直接停下给「被占用」提示。
+                diag("摄像头探测：0号所有后端都打不开 → 继续尝试其它设备号")
+                continue
+            # 0 号能打开、但每种后端/格式都读不到真画面，可能是被占用，也可能只是一个坏的虚拟设备。
+            # 继续试 1/2 号；总超时会兜住慢探测，不再让界面卡几十秒。
             if index == 0 and busy_any:
-                diag("摄像头探测：0号能打开但全程读不到画面 → 疑似被其它程序占用，停止探测")
-                break
+                diag("摄像头探测：0号能打开但读不到画面 → 继续尝试其它设备号")
+                continue
 
         if busy_any:
             self._cam_fail_reason = "busy"
@@ -635,20 +687,25 @@ class ToolDetectionApp:
         self.opening_camera = True
         self._camera_open_token += 1
         token = self._camera_open_token
+        deadline = time.time() + CAMERA_OPEN_TIMEOUT
+        self._camera_open_deadline = deadline
         self.use_camera = True
         self.is_video_file = False
         self.static_frame = None
         self._reset_frame_state()
         self._set_buttons_running(True)
-        self.video_label.configure(image="", text="📷  正在打开摄像头...")
+        self.video_label.configure(
+            image="", text=f"📷  正在打开摄像头...（最多 {CAMERA_OPEN_TIMEOUT:.0f} 秒）")
         self.video_label.imgtk = None
-        self.stats_label.config(text="正在打开摄像头...", fg=C_AMBER)
-        threading.Thread(target=self._open_camera_worker, args=(token,), daemon=True).start()
+        self.stats_label.config(
+            text=f"正在打开摄像头...（最多 {CAMERA_OPEN_TIMEOUT:.0f} 秒）", fg=C_AMBER)
+        self.root.after(int(CAMERA_OPEN_TIMEOUT * 1000), lambda: self._on_camera_open_timeout(token))
+        threading.Thread(target=self._open_camera_worker, args=(token, deadline), daemon=True).start()
 
-    def _open_camera_worker(self, token):
+    def _open_camera_worker(self, token, deadline=None):
         """后台打开摄像头，避免 OpenCV 探测阻塞 Tk 主线程。"""
         try:
-            cap = self._open_camera()
+            cap = self._open_camera(token=token, deadline=deadline)
             error = None
         except Exception as e:
             cap = None
@@ -659,6 +716,25 @@ class ToolDetectionApp:
             if cap is not None:
                 cap.release()
 
+    def _on_camera_open_timeout(self, token):
+        """打开摄像头超时：取消本次打开请求，避免界面一直停在打开中。"""
+        if token != self._camera_open_token or not self.opening_camera:
+            return
+        self.opening_camera = False
+        self._camera_open_token += 1
+        self._camera_open_deadline = None
+        self._cam_fail_reason = "timeout"
+        self._set_buttons_running(False)
+        self.video_label.configure(image="", text="📷  点击下方按钮开始检测")
+        self.video_label.imgtk = None
+        self.stats_label.config(text="摄像头打开超时", fg="#ff6b6b")
+        diag(f"摄像头探测：超过 {CAMERA_OPEN_TIMEOUT:.0f}s 未完成，已取消本次打开")
+        messagebox.showwarning(
+            "摄像头打开超时",
+            f"打开摄像头超过 {CAMERA_OPEN_TIMEOUT:.0f} 秒，已取消本次操作。\n\n"
+            "请先确认摄像头没有被 oCam、微信/QQ 视频、浏览器页面或 Windows 相机占用，"
+            "再重新点击「📷 摄像头检测」。")
+
     def _on_camera_opened(self, token, cap, error=None):
         """摄像头打开结果回到主线程处理。"""
         if token != self._camera_open_token or not self.opening_camera:
@@ -667,6 +743,7 @@ class ToolDetectionApp:
             return
 
         self.opening_camera = False
+        self._camera_open_deadline = None
         if error is not None:
             if cap is not None:
                 cap.release()
@@ -679,8 +756,16 @@ class ToolDetectionApp:
             self._set_buttons_running(False)
             self.video_label.configure(image="", text="📷  点击下方按钮开始检测")
             self.video_label.imgtk = None
-            self.stats_label.config(text="摄像头不可用", fg="#ff6b6b")
-            if getattr(self, "_cam_fail_reason", None) == "busy":
+            fail_reason = getattr(self, "_cam_fail_reason", None)
+            if fail_reason == "timeout":
+                self.stats_label.config(text="摄像头打开超时", fg="#ff6b6b")
+                messagebox.showwarning(
+                    "摄像头打开超时",
+                    f"打开摄像头超过 {CAMERA_OPEN_TIMEOUT:.0f} 秒，已取消本次操作。\n\n"
+                    "请先确认摄像头没有被 oCam、微信/QQ 视频、浏览器页面或 Windows 相机占用，"
+                    "再重新点击「📷 摄像头检测」。")
+            elif fail_reason == "busy":
+                self.stats_label.config(text="摄像头不可用", fg="#ff6b6b")
                 # 能打开但读不到画面 = 设备在、被独占。明确告诉用户关掉占用程序，别让他以为是程序坏了。
                 messagebox.showwarning(
                     "摄像头被占用",
@@ -692,6 +777,7 @@ class ToolDetectionApp:
                     "  • Windows「相机」App\n\n"
                     "关掉后再点「📷 摄像头检测」即可秒开；也可改用「🎬 视频检测」「🖼 图片检测」。")
             else:
+                self.stats_label.config(text="摄像头不可用", fg="#ff6b6b")
                 messagebox.showwarning(
                     "未找到摄像头",
                     "没有检测到可用摄像头。\n请检查摄像头是否插好，"
@@ -787,6 +873,7 @@ class ToolDetectionApp:
         was_signal_lost = self._camera_signal_lost
         self.opening_camera = False
         self._camera_open_token += 1
+        self._camera_open_deadline = None
         self._next_run_token()
         self.running = False
         self.should_speak = False

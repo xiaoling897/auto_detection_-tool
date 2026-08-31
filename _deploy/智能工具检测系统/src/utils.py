@@ -1,9 +1,15 @@
 """公用工具：路径解析、中文路径读图"""
+import sys
 from pathlib import Path
 import cv2
 import numpy as np
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# 打包成 EXE（PyInstaller，sys.frozen）后，data/ 放在 exe 同级目录；
+# 普通源码运行时按项目根定位。两种情况都解析到一个 data/ 目录。
+if getattr(sys, "frozen", False):
+    PROJECT_ROOT = Path(sys.executable).resolve().parent
+else:
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 
 
