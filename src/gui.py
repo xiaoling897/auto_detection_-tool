@@ -16,6 +16,7 @@
 依赖 data/smart_tools.json 里的工具配置 + data/smart_templates/ 下的模板图。
 """
 import os
+import sys
 import threading
 import time
 import tkinter as tk
@@ -68,7 +69,12 @@ DIAG_PATH = DATA_DIR / "run_diag.txt"
 
 def diag(msg):
     line = f"[{time.strftime('%H:%M:%S')}] {msg}"
-    print(line)
+    try:
+        print(line)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        safe = line.encode(encoding, errors="replace").decode(encoding, errors="replace")
+        print(safe)
     try:
         with open(DIAG_PATH, "a", encoding="utf-8") as f:
             f.write(line + "\n")
@@ -126,6 +132,8 @@ class ToolDetectionApp:
         self.static_frame = None
         self.running = False
         self.should_speak = False
+        self.opening_camera = False
+        self._camera_open_token = 0
         self.last_seen = {}      # 工具名 -> 上次识别到的时间戳
         self.last_counts = {}    # 工具名 -> 上一帧 RANSAC 内点数
         self.last_source = {}    # 工具名 -> 上一帧命中来源（"强"/"弱"/"色"）
@@ -571,12 +579,61 @@ class ToolDetectionApp:
 
     def detect_camera(self):
         """摄像头检测：打开摄像头 → 实时双线程检测。"""
+        if self.opening_camera:
+            return
         if self.running:
             self.stop_detection()
         if not self._check_ready():
             return
-        cap = self._open_camera()
+
+        self.opening_camera = True
+        self._camera_open_token += 1
+        token = self._camera_open_token
+        self.use_camera = True
+        self.is_video_file = False
+        self.static_frame = None
+        self._reset_frame_state()
+        self._set_buttons_running(True)
+        self.video_label.configure(image="", text="📷  正在打开摄像头...")
+        self.video_label.imgtk = None
+        self.stats_label.config(text="正在打开摄像头...", fg=C_AMBER)
+        threading.Thread(target=self._open_camera_worker, args=(token,), daemon=True).start()
+
+    def _open_camera_worker(self, token):
+        """后台打开摄像头，避免 OpenCV 探测阻塞 Tk 主线程。"""
+        try:
+            cap = self._open_camera()
+            error = None
+        except Exception as e:
+            cap = None
+            error = e
+        try:
+            self.root.after(0, lambda: self._on_camera_opened(token, cap, error))
+        except Exception:
+            if cap is not None:
+                cap.release()
+
+    def _on_camera_opened(self, token, cap, error=None):
+        """摄像头打开结果回到主线程处理。"""
+        if token != self._camera_open_token or not self.opening_camera:
+            if cap is not None:
+                cap.release()
+            return
+
+        self.opening_camera = False
+        if error is not None:
+            if cap is not None:
+                cap.release()
+            self._set_buttons_running(False)
+            self.stats_label.config(text="摄像头打开失败", fg="#ff6b6b")
+            messagebox.showerror("摄像头打开失败", f"打开摄像头时出错：\n{error}")
+            return
+
         if cap is None:
+            self._set_buttons_running(False)
+            self.video_label.configure(image="", text="📷  点击下方按钮开始检测")
+            self.video_label.imgtk = None
+            self.stats_label.config(text="摄像头不可用", fg="#ff6b6b")
             if getattr(self, "_cam_fail_reason", None) == "busy":
                 # 能打开但读不到画面 = 设备在、被独占。明确告诉用户关掉占用程序，别让他以为是程序坏了。
                 messagebox.showwarning(
@@ -594,6 +651,7 @@ class ToolDetectionApp:
                     "没有检测到可用摄像头。\n请检查摄像头是否插好，"
                     "或改用「🎬 视频检测」「🖼 图片检测」。")
             return
+
         self.cap = cap
         self.use_camera = True
         self.is_video_file = False
@@ -671,17 +729,32 @@ class ToolDetectionApp:
         self._begin_realtime(f"正在检测视频（{os.path.basename(file_path)}）…")
 
     def stop_detection(self):
+        was_opening = self.opening_camera
+        was_signal_lost = self._camera_signal_lost
+        self.opening_camera = False
+        self._camera_open_token += 1
         self.running = False
         self.should_speak = False
         self._infer_running = False   # 停掉后台推理线程
+        self._camera_signal_lost = False
         self.voice.stop()             # 立刻打断正在念的语音（不管念没念完）
 
         if self.cap is not None:
-            self.cap.release()
+            cap = self.cap
             self.cap = None
+            cap.release()
+
+        with self._frame_lock:
+            self._latest_frame = None
+            if was_signal_lost or was_opening:
+                self._display_frame = None
+                self._display_id += 1
 
         self._set_buttons_running(False)
         self.refresh_visible_list()
+        if was_signal_lost or was_opening:
+            self.video_label.configure(image="", text="📷  点击下方按钮开始检测")
+            self.video_label.imgtk = None
         self.stats_label.config(text="已停止", fg="#ff6b6b")
 
     def reset_display(self):
@@ -689,7 +762,7 @@ class ToolDetectionApp:
 
         必须先停检测，否则静态/摄像头线程会立刻把 last_seen 填回去，看起来"没清掉"。
         """
-        if self.running:
+        if self.running or self.opening_camera:
             self.stop_detection()
 
         self.last_seen = {}
@@ -760,7 +833,12 @@ class ToolDetectionApp:
         bad_frames = 0
         last_bad_diag = 0.0
         while self.running and self.cap is not None:
-            ret, frame = self.cap.read()
+            cap = self.cap
+            if cap is None:
+                break
+            ret, frame = cap.read()
+            if not self.running or self.cap is None:
+                break
             if not ret or frame is None:
                 if self.is_video_file:
                     break          # 视频放完 → 退出循环，自动停止
