@@ -35,6 +35,13 @@ class VoiceReporter:
         if self._available:
             self._cmds.put(("speak", list(missing_tools)))
 
+    def say(self, texts):
+        """请求播报指定文本列表。非阻塞，会顶掉上一条没念完的。"""
+        if self._available:
+            if isinstance(texts, str):
+                texts = [texts]
+            self._cmds.put(("say", list(texts)))
+
     def stop(self):
         """立刻停止当前播报并清空待播队列（点「停止检测」时调）。非阻塞。"""
         if self._available:
@@ -59,5 +66,8 @@ class VoiceReporter:
                     texts = ["工具齐全"] if not data else [t + "缺失" for t in data]
                     for t in texts:
                         speaker.Speak(t, _ASYNC)     # 异步排队播放，本线程不阻塞
+                elif action == "say":
+                    for t in data:
+                        speaker.Speak(t, _ASYNC)
             except Exception as e:
                 print(f"语音播报出错: {e}")
