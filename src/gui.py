@@ -10,7 +10,7 @@
   - 静态图模式：弹文件框选图 → 检测一次 → 立即刷新列表
   - 右侧列表全量显示全部工具，识别中的（✓ 绿）排上面，未识别的（✗ 红）排下面
   - 列表 UI 每 3 秒刷新一次（不实时刷新，避免闪烁）；可见性窗口 3 秒
-  - 每 8 秒播报一次当前缺失的工具
+  - 检测出结果后等待 3 秒，再播报当前工具齐全/缺失状态
   - "🔄 清空显示"先停检测再清空 last_seen
 
 依赖 data/smart_tools.json 里的工具配置 + data/smart_templates/ 下的模板图。
@@ -37,7 +37,7 @@ VISIBILITY_WINDOW = 3.0     # 工具可见性窗口（去抖）：最近 N 秒�
                             # 设大一点能吸收"检测抖动 + 伸手遮挡"导致的瞬时漏检，
                             # 避免拿走一个工具时把旁边被手挡住的工具误报成缺失。
                             # 太小→误报缺失；太大→真拿走后要等更久才报。同时影响列表/框/语音。
-SPEAK_INTERVAL = 8.0        # 语音播报间隔
+SPEAK_INTERVAL = 3.0        # 语音播报间隔
 BAD_FRAME_LIMIT = 3         # 摄像头连续坏帧达到这个次数后，清掉旧框和旧识别结果
 BLANK_MEAN_THRESHOLD = 6.0  # 接近全黑的平均亮度阈值
 BLANK_STD_THRESHOLD = 4.0   # 接近纯色黑屏的纹理/方差阈值
@@ -155,7 +155,8 @@ class ToolDetectionApp:
         self._last_shown_id = -1
         self._last_recog = None
         self._last_ui_refresh = 0.0
-        self._last_speak = 0.0
+        self._last_speak = None
+        self._has_detection_sample = False
         self._camera_signal_lost = False
 
         diag("=" * 50)
@@ -404,6 +405,8 @@ class ToolDetectionApp:
         self._last_annotated = None
         self._last_recog = None
         self._last_ui_refresh = 0.0
+        self._last_speak = None
+        self._has_detection_sample = False
         with self._frame_lock:
             self._latest_frame = None
 
@@ -769,6 +772,8 @@ class ToolDetectionApp:
         self.last_counts = {}
         self._last_boxes = []
         self._last_annotated = None
+        self._last_speak = None
+        self._has_detection_sample = False
         try:
             self.refresh_visible_list()
             self.video_label.configure(image="", text="📷  点击下方按钮开始检测")
@@ -803,7 +808,8 @@ class ToolDetectionApp:
         self._last_shown_id = -1
         self._last_recog = None
         self._last_ui_refresh = 0.0
-        self._last_speak = time.time()   # 首次播报推迟 SPEAK_INTERVAL，别一打开就念一堆
+        self._last_speak = None
+        self._has_detection_sample = False
         with self._frame_lock:
             self._display_frame = None
             self._display_id = 0
@@ -958,8 +964,10 @@ class ToolDetectionApp:
             self._last_ui_refresh = now
             self._last_recog = recog_now
 
-        # 语音播报（report 非阻塞，瞬间返回）
-        if self.should_speak and now - self._last_speak >= SPEAK_INTERVAL:
+        # 语音播报：必须等模型至少完成过一次检测，再从检测结果出来后计时。
+        if (self.should_speak and self._has_detection_sample
+                and self._last_speak is not None
+                and now - self._last_speak >= SPEAK_INTERVAL):
             self.speak_missing()
             self._last_speak = now
 
@@ -1018,6 +1026,7 @@ class ToolDetectionApp:
             last_detect = now
 
             t_infer = time.time()
+            inference_ok = True
             try:
                 if self.use_yolo:
                     detected, counts, boxes = self.detector_engine.infer(frame)
@@ -1028,6 +1037,7 @@ class ToolDetectionApp:
             except Exception as e:
                 diag(f"检测出错: {e}")
                 detected, counts = set(), {}
+                inference_ok = False
             if self._camera_signal_lost:
                 self._last_boxes = []
                 self._last_annotated = None
@@ -1039,6 +1049,9 @@ class ToolDetectionApp:
             for name in detected:
                 self.last_seen[name] = stamp
             self.last_counts.update(counts)
+            if inference_ok and not self._has_detection_sample:
+                self._has_detection_sample = True
+                self._last_speak = stamp
             self.last_source = dict(getattr(self.detector_engine, "last_source", {}))
             self.detect_threshold = getattr(self.detector_engine, "last_threshold", 0)
             hits = " ".join(

@@ -27,7 +27,7 @@ from .voice import VoiceReporter
 DETECT_INTERVAL = 0.4       # 检测节流（CPU 友好）
 UI_REFRESH_INTERVAL = 3.0   # 列表 UI 刷新节奏
 VISIBILITY_WINDOW = 3.0     # 工具可见性窗口：最近 N 秒内识别到才显示
-SPEAK_INTERVAL = 8.0        # 语音播报间隔
+SPEAK_INTERVAL = 3.0        # 检测出结果后等待 3 秒再播报
 
 
 class ToolDetectionApp:
@@ -390,7 +390,7 @@ class ToolDetectionApp:
             self.stop_detection()
 
     def _camera_loop(self):
-        last_speak = 0.0
+        last_speak = None
         last_detect = 0.0
         last_ui_refresh = 0.0
         while self.running and self.cap is not None:
@@ -417,6 +417,8 @@ class ToolDetectionApp:
                     f"{n}={counts.get(n, 0)}{self.last_source.get(n, '')}"
                     for n in sorted(detected))
                 print(f"[检测 {len(detected)}个] {hits or '(空)'}")
+                if last_speak is None:
+                    last_speak = now
 
             self._show_frame(display)
 
@@ -425,7 +427,8 @@ class ToolDetectionApp:
                 self.refresh_visible_list()
                 last_ui_refresh = now
 
-            if self.should_speak and now - last_speak >= SPEAK_INTERVAL:
+            if (self.should_speak and last_speak is not None
+                    and now - last_speak >= SPEAK_INTERVAL):
                 self.speak_missing()
                 last_speak = now
 
