@@ -15,6 +15,7 @@
 
 依赖 data/smart_tools.json 里的工具配置 + data/smart_templates/ 下的模板图。
 """
+import json
 import os
 import sys
 import threading
@@ -38,9 +39,29 @@ VISIBILITY_WINDOW = 3.0     # 工具可见性窗口（去抖）：最近 N 秒�
                             # 避免拿走一个工具时把旁边被手挡住的工具误报成缺失。
                             # 太小→误报缺失；太大→真拿走后要等更久才报。同时影响列表/框/语音。
 SPEAK_INTERVAL = 3.0        # 语音播报间隔
-BAD_FRAME_LIMIT = 3         # 摄像头连续坏帧达到这个次数后，清掉旧框和旧识别结果
+BAD_FRAME_LIMIT = 3         # 「读帧失败」连续这么多次 → 判定信号丢失（拔线/断流，立刻要报）
+BLANK_FRAME_LIMIT = 25      # 「读到但全黑」要连续这么多次才判定信号丢失（≈1s 以上）。
+                            # 必须比 BAD_FRAME_LIMIT 大很多：摄像头刚打开时自动曝光没起来，
+                            # 头几十帧就是黑的，用 3 帧判定会在开机瞬间闪一下"无信号"橙屏。
+CAMERA_WARMUP_GRACE = 3.0   # 摄像头开流后的宽限期：这段时间内的黑帧一律不算"信号丢失"，
+                            # 专治"刚打开闪一下橙屏再恢复"的闪屏。
 BLANK_MEAN_THRESHOLD = 6.0  # 接近全黑的平均亮度阈值
 BLANK_STD_THRESHOLD = 4.0   # 接近纯色黑屏的纹理/方差阈值
+
+# 视频显示画布固定尺寸（16:9）。固定住有两个作用：
+#   ① 每帧 letterbox 到同一尺寸 → PhotoImage 只建一次、后续 paste 原地更新，不再每帧
+#      configure(image=...)（那会让 Tk 擦背景+重算布局，就是"画面一闪一闪"的主因）；
+#   ② 画面尺寸恒定 → 左侧视频区不会随分辨率/文字占位符变大变小把右侧清单挤得来回跳。
+#   尺寸取 900x506：是在最小窗口(minsize 1200x760，视频区实测可用 900x588)下**不被裁切的
+#   最大 16:9 画布**，同时和 720p 摄像头同比例、缩放后正好铺满不留黑边。要改先量可用区。
+DISPLAY_W, DISPLAY_H = 900, 506
+CANVAS_BG_BGR = (26, 14, 10)   # = C_VIDEO #0a0e1a 的 BGR，留黑边和视频区同色
+
+CAMERA_PROBE_BUDGET = 10.0  # 整轮探测的总时间预算（秒）。最坏情况（几个设备号都能打开
+                            # 却都不出流）也不会无限拖，超时就停下给明确提示。
+
+# 上次成功打开摄像头的配置缓存：命中后下次直接一步打开（省掉整轮探测的十几秒）。
+CAMERA_PREF_PATH = DATA_DIR / "camera_pref.json"
 
 # ---- 配色（统一暗色主题，集中放这里方便整体换肤）----
 C_BG = "#0f1629"            # 窗口主背景（深海军蓝）
@@ -158,6 +179,7 @@ class ToolDetectionApp:
         self._last_speak = None
         self._has_detection_sample = False
         self._camera_signal_lost = False
+        self._imgtk = None       # 视频区复用的 PhotoImage（见 _show_frame）
 
         diag("=" * 50)
         diag(f"启动诊断：后端={'YOLO' if self.use_yolo else 'SIFT(回退)'}, "
@@ -217,6 +239,11 @@ class ToolDetectionApp:
         video_card = tk.Frame(left, bg=C_VIDEO, highlightbackground=C_BORDER,
                               highlightthickness=1, bd=0)
         video_card.pack(fill="both", expand=True)
+        # 关掉尺寸传播：不让里面的图片/文字反过来撑大卡片。
+        # 否则"文字占位符(很小) → 第一帧画面(900x506)"这一下会把左栏撑开、右侧清单被挤，
+        # 整个界面抖一下 —— 这也是"打开摄像头时闪一下"的一部分。
+        video_card.pack_propagate(False)
+        video_card.configure(width=DISPLAY_W + 14, height=DISPLAY_H + 14)
         self.video_label = tk.Label(video_card, bg=C_VIDEO, fg=C_MUTED,
                                     text="📷  点击下方按钮开始检测",
                                     font=(FONT, 15))
@@ -370,9 +397,7 @@ class ToolDetectionApp:
             self.count_badge.config(
                 text=f"{len(recognized)}/{total}",
                 fg=C_GREEN if recognized else C_MUTED)
-            self.stats_label.config(
-                text=f"当前识别 {len(recognized)} / {total} 个工具",
-                fg=C_TEXT)
+            self._set_stats(f"当前识别 {len(recognized)} / {total} 个工具", C_TEXT)
             return len(recognized)
         except Exception as e:
             print(f"刷新列表出错: {e}")
@@ -436,33 +461,44 @@ class ToolDetectionApp:
     #   · 换 MSMF 后端：DSHOW 对现代 4K UVC 经常打不开或卡 4K 大帧，MSMF 往往更稳；
     #   · 放开分辨率（native=用摄像头默认值）：有些 4K 机拒绝被设成 720p，只好接受其原生分辨率。
     # (backend, 后端名, 是否强设720p, 是否设MJPG)
-    _CAM_ATTEMPTS = [
+    # 分两档是为了"广度优先"（见 _open_camera）：
+    #   _CAM_FAST 每个后端只留最可能成的一项，先把所有设备号快速扫一遍——
+    #     摄像头飘到 1 号时能马上找到，不用先把 0 号的 6 种组合试穿（要多等好几秒）。
+    #   _CAM_DEEP 是 4K UVC 的兜底格式，只对"确实打得开的设备号"再补试。
+    _CAM_FAST = [
         (cv2.CAP_DSHOW, "DSHOW", True,  False),
-        (cv2.CAP_DSHOW, "DSHOW", True,  True),
         (cv2.CAP_MSMF,  "MSMF",  True,  False),
+    ]
+    _CAM_DEEP = [
+        (cv2.CAP_DSHOW, "DSHOW", True,  True),
         (cv2.CAP_MSMF,  "MSMF",  True,  True),
         (cv2.CAP_MSMF,  "MSMF",  False, False),  # native 分辨率兜底
         (cv2.CAP_DSHOW, "DSHOW", False, False),
     ]
+    _CAM_ATTEMPTS = _CAM_FAST + _CAM_DEEP   # 完整顺序（旧代码/脚本引用它）
 
-    def _try_open(self, index, flag, force_720p, use_mjpg, warmup_frames, budget=2.5):
+    def _try_open(self, index, flag, force_720p, use_mjpg,
+                  budget=1.2, accept_dark=False):
         """按指定后端/分辨率/格式打开一次，预热读帧判断是否有真画面。
 
-        返回 (cap 或 None, opened)：
-          - cap 非 None  → 出了真画面，已配好，可直接用；
-          - cap 为 None 且 opened=True  → 设备能打开但没出可用画面（黑/灰屏或出流失败/被占用）；
-          - cap 为 None 且 opened=False → 这个设备号/后端根本打不开。
-        opened 用于上层判断「0 号是否存在摄像头子系统」，决定要不要继续往后探。
+        返回 (cap, opened, streamed)：
+          - cap 非 None  → 拿到可用画面，已配好，可直接用；
+          - opened       → 设备句柄能不能打开（区分「没这个设备」和「设备在但不出流」）；
+          - streamed     → 有没有读到过真帧（哪怕全是黑的）。**这是新增的关键信号**：
+                           读得到帧 = 摄像头是活的，只是自动曝光还没起来 / 镜头被挡，
+                           不该当成"打不开"扔掉（这正是以前白白多试 5 个组合、
+                           多花十几秒的根因）。
 
-        budget：本次尝试的「读真画面」总时间预算（秒）。摄像头被别的程序占用时，
-        设备句柄能打开但 cap.read() 一直读不到真画面、会一直阻塞重试——没有这个预算，
-        一次尝试能干等 9~13s，6 个组合叠起来就是「点了检测半天不出画面」。加预算后
-        每次尝试最多卡 ~budget 秒就放弃，占用场景从一分多钟降到十几秒并能明确提示。
+        budget：本次尝试的读帧时间预算（秒）。以前是"最多读 8 帧、每帧后 sleep(0.05)"，
+        对慢启动的摄像头只给了约 0.4s，曝光还没起来就被判失败；现在改成按时间预算循环，
+        读得到帧就不再 sleep，既不误杀慢启动的机器，也不会在被占用时干等。
+
+        accept_dark=True：第二轮兜底用——只要读得到帧就接受，不再要求画面够亮。
         """
         cap = cv2.VideoCapture(index, flag)
         if not cap.isOpened():
             cap.release()
-            return None, False
+            return None, False, False
 
         # 关键：分辨率/格式必须在预热读帧之前设好。旧代码先用默认分辨率预热、之后才设 720p，
         # 4K 机就会拿 3840x2160 大帧预热，读帧奇慢——这正是换 4K 摄像头后"卡 + 打不开"的元凶之一。
@@ -481,62 +517,162 @@ class ToolDetectionApp:
         except Exception:
             pass
 
+        streamed = False
         deadline = time.time() + budget
-        for _ in range(warmup_frames):
+        while True:
             ret, frame = cap.read()
-            if ret and frame is not None and float(frame.std()) > 6.0:
-                return cap, True
-            # 超出时间预算就立即放弃这次尝试——被占用时 read() 会持续读不到真画面，
-            # 不设这个上限就会一直耗到 warmup_frames 用完（每次 9~13s）。
+            if ret and frame is not None and frame.size:
+                streamed = True
+                # 隔行采样再算方差：4K native 那几种组合整帧是 2500 万个数，
+                # 一秒预算里要算几十次会白烧 CPU；判"有没有真画面"用 1/64 的点足够。
+                if accept_dark or float(frame[::8, ::8].std()) > 6.0:
+                    return cap, True, True
+            else:
+                # 只有"读不到帧"才让出时间片；读得到就连着读，别人为拖慢开机
+                time.sleep(0.03)
             if time.time() >= deadline:
                 break
-            time.sleep(0.05)
 
         cap.release()
-        return None, True
+        return None, True, streamed
 
-    def _open_camera(self, max_index=2, warmup_frames=8):
+    # ---- 上次成功配置的缓存：把整轮探测降成一次打开 ----
+
+    def _load_cam_pref(self):
+        """读上次成功打开摄像头的配置（读坏/不存在都当没有，绝不因此影响开机）。"""
+        try:
+            with open(CAMERA_PREF_PATH, "r", encoding="utf-8") as f:
+                pref = json.load(f)
+            return (int(pref["index"]), str(pref["backend"]),
+                    bool(pref["force_720p"]), bool(pref["mjpg"]))
+        except Exception:
+            return None
+
+    def _save_cam_pref(self, index, bname, force_720p, use_mjpg):
+        try:
+            with open(CAMERA_PREF_PATH, "w", encoding="utf-8") as f:
+                json.dump({"index": index, "backend": bname,
+                           "force_720p": force_720p, "mjpg": use_mjpg}, f)
+        except Exception:
+            pass
+
+    def _open_camera(self, max_index=2):
         """打开一个可用摄像头，返回配置好的 VideoCapture（失败返回 None）。
 
-        换摄像头也能用——不写死设备号、不写死后端、不靠单帧判断：
-          - 逐个设备号（0→max_index，外接 USB 常在 1、2）× 逐项尝试矩阵 _CAM_ATTEMPTS
-            （DSHOW/MSMF 双后端 + 720p/native 双分辨率 + 选配 MJPG），第一个出真画面的就用。
-          - 关键早退出：若 0 号在**所有后端**都连打开都失败，说明基本没有摄像头子系统，直接放弃，
-            不再往后探。因为 DSHOW 探测不存在的设备号每个要卡 7-9s，无摄像头的机器否则要白等。
-          - 预热读最多 warmup_frames 帧：很多摄像头首帧是黑/绿/花屏，读到方差够大（std>6.0，
-            能区分真画面与均匀灰屏的虚拟设备）就判定可用，避免把预热慢的真摄像头误判成无摄像头。
+        为什么这么写（"点一下要等 10 多秒"和"明明插着却说没摄像头"都是被下面这几条治掉的）：
+          1. **优先用上次成功的配置**：命中就一次打开搞定（<1s），不再每次从头探整个矩阵。
+          2. **广度优先**：先拿最可能成的「720p/默认格式」把 0→1→2 号全扫一遍（每号最多
+             DSHOW/MSMF 两次打开），再回头给开得开的设备号试 MJPG/native 那几种 4K 兜底组合。
+             以前是"把 0 号 6 种组合试穿再看 1 号"，0 号被占用时要白等 7 秒才轮到真摄像头。
+          3. **绝不在 0 号就放弃**：日志里实测有过「0 号全后端打不开、真摄像头在 1 号」的机器
+             （USB 摄像头枚举在 Windows 上会飘），旧逻辑直接报"未找到摄像头"。实测探一个
+             不存在的设备号只要 0~40ms（不是注释里说的 7-9s），扫完 1、2 号也就多花 0.1s。
+          4. **判"有画面"的标准别太急**：见 _try_open——读得到帧就说明设备是活的，
+             只是曝光没起来/环境暗，直接接受，不该关掉再试下一套（这是那 10 多秒的主因）。
+          5. **总预算兜底**：最坏情况（几个设备号都能打开却都不出流）也不会无限拖，
+             超过 CAMERA_PROBE_BUDGET 就停下来给明确提示。
         """
         # 失败原因：None=还没结论 / "busy"=能打开但读不到真画面(疑似被占用) / "none"=根本没摄像头。
-        # 给 detect_camera 用来决定弹「被占用」还是「没找到摄像头」两种不同提示。
         self._cam_fail_reason = None
-        busy_any = False
-        for index in range(max_index + 1):
-            opened_any = False
-            for flag, bname, force_720p, use_mjpg in self._CAM_ATTEMPTS:
-                cap, opened = self._try_open(index, flag, force_720p, use_mjpg, warmup_frames)
-                opened_any = opened_any or opened
-                res = f"{'720p' if force_720p else 'native'}/{'MJPG' if use_mjpg else '默认'}"
-                if cap is not None:
-                    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                    diag(f"摄像头探测：设备{index} {bname} {res} → ✅ 打开成功 {w}x{h}")
-                    return cap
-                # 失败也记日志（写进 run_diag.txt），方便在接了摄像头那台机器远程定位卡在哪
-                if opened:
-                    busy_any = True   # 能打开但读不到真画面 → 设备存在，多半是被占用/格式不出流
-                why = "连打开都失败" if not opened else "能打开但读不到真画面(忙/格式不出流)"
-                diag(f"摄像头探测：设备{index} {bname} {res} → ✗ {why}")
-            # 0 号所有后端都打不开 → 基本无摄像头，立即放弃，避免后续设备号的 7-9s 空卡
-            if index == 0 and not opened_any:
-                diag("摄像头探测：0号所有后端都打不开 → 判定无摄像头子系统，停止探测")
-                break
-            # 0 号能打开、但每种后端/格式都读不到真画面 → 极可能被别的程序(oCam/微信/浏览器/相机)
-            # 独占了。再往后探设备 1/2 也大概率同样被占，没必要白等，直接停下给「被占用」提示。
-            if index == 0 and busy_any:
-                diag("摄像头探测：0号能打开但全程读不到画面 → 疑似被其它程序占用，停止探测")
-                break
+        t_start = time.time()
 
-        if busy_any:
+        def over_budget():
+            return time.time() - t_start > CAMERA_PROBE_BUDGET
+
+        # ---- 0. 先试上次成功的配置 ----
+        pref = self._load_cam_pref()
+        if pref is not None:
+            index, bname, force_720p, use_mjpg = pref
+            flag = cv2.CAP_DSHOW if bname == "DSHOW" else cv2.CAP_MSMF
+            cap, _, _ = self._try_open(index, flag, force_720p, use_mjpg,
+                                       budget=1.5, accept_dark=True)
+            if cap is not None:
+                w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                diag(f"摄像头：命中上次配置 设备{index} {bname} "
+                     f"{'720p' if force_720p else 'native'}/{'MJPG' if use_mjpg else '默认'}"
+                     f" → ✅ {w}x{h}，耗时 {(time.time() - t_start) * 1000:.0f}ms")
+                return cap
+            # 删掉失效缓存：否则下次开机还要先在这套配置上白等 1.5s 才转完整探测
+            # （探测成功会重新写入，所以只是"临时抽风"的话下一次就自动补回来）
+            try:
+                os.remove(CAMERA_PREF_PATH)
+            except OSError:
+                pass
+            diag("摄像头：上次配置不再可用（已清掉缓存），转入完整探测")
+
+        # ---- 1. 完整探测：先广度(_CAM_FAST 扫所有设备号)，再深度(_CAM_DEEP 补格式) ----
+        opened_any = {}     # 设备号 -> 该号至少被某个后端打开过（说明设备存在）
+        dead = set()        # (设备号, 后端名)：连打开都失败的组合，后面不再试
+        dark_hit = None     # (index, flag, bname, force_720p, use_mjpg)：读得到帧但画面偏暗
+
+        def sweep(attempts, indices):
+            """按给定组合表扫一遍给定设备号；拿到画面就直接返回 cap。"""
+            nonlocal dark_hit
+            for index in indices:
+                for flag, bname, force_720p, use_mjpg in attempts:
+                    if (index, bname) in dead or over_budget():
+                        continue
+                    t0 = time.time()
+                    cap, opened, streamed = self._try_open(index, flag, force_720p, use_mjpg)
+                    res = f"{'720p' if force_720p else 'native'}/{'MJPG' if use_mjpg else '默认'}"
+                    cost = (time.time() - t0) * 1000
+                    if opened:
+                        opened_any[index] = True
+                    if cap is not None:
+                        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                        diag(f"摄像头探测：设备{index} {bname} {res} → ✅ 打开成功 {w}x{h}，"
+                             f"耗时 {cost:.0f}ms，总 {(time.time() - t_start) * 1000:.0f}ms")
+                        self._save_cam_pref(index, bname, force_720p, use_mjpg)
+                        return cap
+                    if not opened:
+                        dead.add((index, bname))   # 同设备同后端换格式也开不了，别白试
+                        why = "连打开都失败"
+                    elif streamed:
+                        # 短路：读得到帧就说明这套组合是通的，只是画面暗（暗房/镜头被挡）。
+                        # 换 MJPG/MSMF/native 不会让画面变亮，继续试纯属白等 → 交给兜底。
+                        why = "能出流但画面偏暗(曝光未起/遮挡)"
+                        dark_hit = (index, flag, bname, force_720p, use_mjpg)
+                    else:
+                        why = "能打开但读不到帧(忙/格式不出流)"
+                    diag(f"摄像头探测：设备{index} {bname} {res} → ✗ {why}，耗时 {cost:.0f}ms")
+                    if dark_hit is not None:
+                        return None
+            return None
+
+        cap = sweep(self._CAM_FAST, range(max_index + 1))
+        if cap is not None:
+            return cap
+        if dark_hit is None and not over_budget():
+            # 深度补探只针对"确实存在的设备号"（4K UVC 常要 MJPG / native 才出流）
+            cap = sweep(self._CAM_DEEP, sorted(opened_any))
+            if cap is not None:
+                return cap
+
+        # ---- 2. 兜底：有组合读得到帧、只是不够亮 → 直接用它（摄像头是活的，别丢） ----
+        if dark_hit is not None:
+            index, flag, bname, force_720p, use_mjpg = dark_hit
+            # 先给 MJPG 变体一次机会再认命：有些 4K UVC 不压缩时只吐无效/暗帧，
+            # 换 MJPG 才出真画面。只多花一次尝试（~1s），却能救回一整类 4K 机。
+            if not use_mjpg:
+                cap, _, _ = self._try_open(index, flag, force_720p, True)
+                if cap is not None:
+                    diag(f"摄像头：设备{index} {bname} 默认格式只出暗帧，改 MJPG → ✅ 总耗时 "
+                         f"{(time.time() - t_start) * 1000:.0f}ms")
+                    self._save_cam_pref(index, bname, force_720p, True)
+                    return cap
+            cap, _, _ = self._try_open(index, flag, force_720p, use_mjpg,
+                                       budget=2.0, accept_dark=True)
+            if cap is not None:
+                diag(f"摄像头：按'能出流但偏暗'兜底采用 设备{index} {bname} → ✅ 总耗时 "
+                     f"{(time.time() - t_start) * 1000:.0f}ms（画面暗请检查环境光/镜头盖）")
+                self._save_cam_pref(index, bname, force_720p, use_mjpg)
+                return cap
+
+        if over_budget():
+            diag(f"摄像头探测：超过 {CAMERA_PROBE_BUDGET}s 预算，停止探测")
+        if opened_any:
             self._cam_fail_reason = "busy"
             diag("⚠️ 摄像头疑似被其它程序占用（请关闭 oCam/微信视频/浏览器/相机后重试）")
         else:
@@ -575,7 +711,7 @@ class ToolDetectionApp:
         self.should_speak = True
         self._reset_frame_state()
         self._set_buttons_running(True)
-        self.stats_label.config(text=status_text, fg=C_GREEN)
+        self._set_stats(status_text, C_GREEN)
         self.detection_thread = threading.Thread(target=self.detection_loop, daemon=True)
         self.detection_thread.start()
         self._start_ui_pump()
@@ -599,7 +735,8 @@ class ToolDetectionApp:
         self._set_buttons_running(True)
         self.video_label.configure(image="", text="📷  正在打开摄像头...")
         self.video_label.imgtk = None
-        self.stats_label.config(text="正在打开摄像头...", fg=C_AMBER)
+        self._imgtk = None
+        self._set_stats("正在打开摄像头...", C_AMBER)
         threading.Thread(target=self._open_camera_worker, args=(token,), daemon=True).start()
 
     def _open_camera_worker(self, token):
@@ -628,7 +765,7 @@ class ToolDetectionApp:
             if cap is not None:
                 cap.release()
             self._set_buttons_running(False)
-            self.stats_label.config(text="摄像头打开失败", fg="#ff6b6b")
+            self._set_stats("摄像头打开失败", "#ff6b6b")
             messagebox.showerror("摄像头打开失败", f"打开摄像头时出错：\n{error}")
             return
 
@@ -636,7 +773,8 @@ class ToolDetectionApp:
             self._set_buttons_running(False)
             self.video_label.configure(image="", text="📷  点击下方按钮开始检测")
             self.video_label.imgtk = None
-            self.stats_label.config(text="摄像头不可用", fg="#ff6b6b")
+            self._imgtk = None
+            self._set_stats("摄像头不可用", "#ff6b6b")
             if getattr(self, "_cam_fail_reason", None) == "busy":
                 # 能打开但读不到画面 = 设备在、被独占。明确告诉用户关掉占用程序，别让他以为是程序坏了。
                 messagebox.showwarning(
@@ -690,7 +828,7 @@ class ToolDetectionApp:
         self.should_speak = True
         self._reset_frame_state()
         self._set_buttons_running(True)
-        self.stats_label.config(text="检测图片中…", fg=C_AMBER)
+        self._set_stats("检测图片中…", C_AMBER)
         self.detection_thread = threading.Thread(target=self.detection_loop, daemon=True)
         self.detection_thread.start()   # 静态图一次性显示，不需要 UI 泵
 
@@ -758,7 +896,8 @@ class ToolDetectionApp:
         if was_signal_lost or was_opening:
             self.video_label.configure(image="", text="📷  点击下方按钮开始检测")
             self.video_label.imgtk = None
-        self.stats_label.config(text="已停止", fg="#ff6b6b")
+            self._imgtk = None
+        self._set_stats("已停止", "#ff6b6b")
 
     def reset_display(self):
         """清空显示 = 停止当前检测 + 清空 last_seen + 清空画面。
@@ -778,20 +917,57 @@ class ToolDetectionApp:
             self.refresh_visible_list()
             self.video_label.configure(image="", text="📷  点击下方按钮开始检测")
             self.video_label.imgtk = None
-            self.stats_label.config(text="已清空，待检测", fg=C_MUTED)
+            self._imgtk = None
+            self._set_stats("已清空，待检测", C_MUTED)
         except Exception as e:
             print(f"清空显示出错: {e}")
 
     # ---------------- 检测循环 ----------------
 
+    @staticmethod
+    def _letterbox(frame_bgr):
+        """等比缩放并居中贴到固定尺寸画布（不足处补视频区同色黑边）。
+
+        固定尺寸是防闪的前提：尺寸一变，Tk 就得重算布局、擦背景重画，
+        画面和右侧清单都会跟着抖一下。720p 摄像头缩放后正好铺满，看不到黑边。
+        """
+        h, w = frame_bgr.shape[:2]
+        if h <= 0 or w <= 0:
+            return np.full((DISPLAY_H, DISPLAY_W, 3), CANVAS_BG_BGR, np.uint8)
+        scale = min(DISPLAY_W / w, DISPLAY_H / h)
+        nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+        interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
+        resized = cv2.resize(frame_bgr, (nw, nh), interpolation=interp)
+        if nw == DISPLAY_W and nh == DISPLAY_H:
+            return resized
+        canvas = np.full((DISPLAY_H, DISPLAY_W, 3), CANVAS_BG_BGR, np.uint8)
+        y0, x0 = (DISPLAY_H - nh) // 2, (DISPLAY_W - nw) // 2
+        canvas[y0:y0 + nh, x0:x0 + nw] = resized
+        return canvas
+
+    def _set_stats(self, text, color):
+        """状态栏文字：内容没变就不重设，避免 UI 泵每 15ms 触发一次无谓重绘。"""
+        if getattr(self, "_stats_cache", None) == (text, color):
+            return
+        self._stats_cache = (text, color)
+        self.stats_label.config(text=text, fg=color)
+
     def _show_frame(self, frame_bgr):
-        """把 BGR 帧渲染到视频区"""
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        img = Image.fromarray(frame_rgb)
-        img.thumbnail((900, 650))
-        imgtk = ImageTk.PhotoImage(image=img)
-        self.video_label.imgtk = imgtk
-        self.video_label.configure(image=imgtk)
+        """把 BGR 帧渲染到视频区（原地更新像素，不重建控件图片 → 不闪）。
+
+        闪屏的另一半原因在这里：旧写法每帧都 new 一个 PhotoImage 再 configure(image=...)，
+        Tk 每次都要擦掉标签背景、重算尺寸再贴图，几十 Hz 下就是肉眼可见的一闪一闪。
+        改成"画布尺寸固定 + PhotoImage 只建一次 + paste() 原地覆盖像素"后，
+        既不 configure 也不重算布局，画面平顺。
+        """
+        canvas = self._letterbox(frame_bgr)
+        img = Image.fromarray(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
+        if self._imgtk is None:
+            self._imgtk = ImageTk.PhotoImage(image=img)
+            self.video_label.configure(image=self._imgtk, text="")
+            self.video_label.imgtk = self._imgtk
+        else:
+            self._imgtk.paste(img)      # 原地换像素，控件完全不动
 
     def detection_loop(self):
         try:
@@ -836,8 +1012,12 @@ class ToolDetectionApp:
         # 诊断计数（读帧帧率）
         diag_t0 = time.time()
         diag_frames = 0
-        bad_frames = 0
+        bad_frames = 0       # 连续"读帧失败"计数
+        blank_frames = 0     # 连续"读到但全黑"计数（和读帧失败分开算，见下）
         last_bad_diag = 0.0
+        # 开流宽限期：摄像头刚打开时自动曝光还没起来，头几十帧就是黑的。
+        # 这段时间内不判"信号丢失"，否则一点开就闪一下橙色"无信号"再跳回画面 —— 就是"闪屏"。
+        warmup_until = time.time() + CAMERA_WARMUP_GRACE
         while self.running and self.cap is not None:
             cap = self.cap
             if cap is None:
@@ -849,12 +1029,17 @@ class ToolDetectionApp:
                 if self.is_video_file:
                     break          # 视频放完 → 退出循环，自动停止
                 bad_frames += 1
-                if bad_frames >= BAD_FRAME_LIMIT:
-                    self._camera_signal_lost = True
-                    self._clear_realtime_detection_state()
-                    with self._frame_lock:
-                        self._display_frame = self._signal_lost_frame()
-                        self._display_id += 1
+                if bad_frames >= BAD_FRAME_LIMIT and time.time() >= warmup_until:
+                    # 只在"刚进入丢失状态"那一次做重活。否则读帧失败期间每轮都要重建
+                    # 占位帧 + 清空识别状态，而 _clear_realtime_detection_state 会把
+                    # _last_ui_refresh 归零、把 UI 泵的 1s 节流打穿 —— 右侧清单会被
+                    # 每 15ms 重排一次，本身就是一种闪。
+                    if not self._camera_signal_lost:
+                        self._camera_signal_lost = True
+                        self._clear_realtime_detection_state()
+                        with self._frame_lock:
+                            self._display_frame = self._signal_lost_frame()
+                            self._display_id += 1
                     now_bad = time.time()
                     if now_bad - last_bad_diag >= 2.0:
                         diag(f"摄像头读帧失败连续 {bad_frames} 次：已清理旧框，等待恢复")
@@ -863,23 +1048,35 @@ class ToolDetectionApp:
                 continue
 
             if not self.is_video_file and self._is_blank_frame(frame):
-                bad_frames += 1
-                if bad_frames >= BAD_FRAME_LIMIT:
-                    self._camera_signal_lost = True
-                    self._clear_realtime_detection_state()
-                    with self._frame_lock:
-                        self._display_frame = self._signal_lost_frame(frame)
-                        self._display_id += 1
+                # 全黑帧 ≠ 断流：曝光没起来、镜头被挡、灯灭了都会全黑，但流是好的。
+                # 所以① 用独立的、更大的阈值 BLANK_FRAME_LIMIT（≈1s 以上）；
+                #     ② 开流宽限期内一律不报。这两条一起消掉"刚打开闪一下无信号"的闪屏。
+                blank_frames += 1
+                if blank_frames >= BLANK_FRAME_LIMIT and time.time() >= warmup_until:
+                    if not self._camera_signal_lost:   # 同上：进入丢失状态只做一次
+                        self._camera_signal_lost = True
+                        self._clear_realtime_detection_state()
+                        with self._frame_lock:
+                            self._display_frame = self._signal_lost_frame(frame)
+                            self._display_id += 1
                     now_bad = time.time()
                     if now_bad - last_bad_diag >= 2.0:
-                        diag(f"摄像头输出黑帧连续 {bad_frames} 次：已清理旧框，等待恢复")
+                        diag(f"摄像头输出黑帧连续 {blank_frames} 次：已清理旧框，等待恢复")
                         last_bad_diag = now_bad
-                time.sleep(0.05)
+                else:
+                    # 还没到判定线：照常把这帧显示出去，保持画面连续（黑就黑，别闪占位图）
+                    with self._frame_lock:
+                        self._latest_frame = frame
+                        self._display_frame = frame
+                        self._display_id += 1
+                diag_frames += 1   # 黑帧也算读到了帧，否则日志里帧率会假摔成 0.x fps
+                time.sleep(0.02)
                 continue
 
-            if bad_frames >= BAD_FRAME_LIMIT or self._camera_signal_lost:
+            if self._camera_signal_lost:
                 diag("摄像头画面已恢复")
             bad_frames = 0
+            blank_frames = 0
             self._camera_signal_lost = False
 
             now = time.time()
@@ -951,7 +1148,7 @@ class ToolDetectionApp:
             if now - self._last_ui_refresh >= 1.0:
                 self.refresh_visible_list()
                 self._last_ui_refresh = now
-            self.stats_label.config(text="摄像头无画面，正在重试...", fg=C_AMBER)
+            self._set_stats("摄像头无画面，正在重试...", C_AMBER)
             self.root.after(15, self._ui_pump)
             return
 
@@ -981,7 +1178,7 @@ class ToolDetectionApp:
             self.cap = None
         self._set_buttons_running(False)
         self.refresh_visible_list()
-        self.stats_label.config(text="视频检测完毕", fg="#00ff88")
+        self._set_stats("视频检测完毕", "#00ff88")
 
     def _hold_boxes(self, boxes):
         """框防闪：每个工具的框按名字保留 VISIBILITY_WINDOW 秒。
@@ -1085,9 +1282,7 @@ class ToolDetectionApp:
             total = len(self._valid_tools())
             # 底部数字必须和上方列表一致——用 refresh 返回的 recognized_count，
             # 而不是本帧 len(detected)；连续多次点检测时窗口里旧条目仍算
-            self.stats_label.config(
-                text=f"检测完成：识别 {recognized_count}/{total}",
-                fg="#00ff88")
+            self._set_stats(f"检测完成：识别 {recognized_count}/{total}", "#00ff88")
         except Exception:
             pass
 

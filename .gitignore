@@ -23,6 +23,7 @@ dist/
 /data/video/
 # 运行时诊断日志（每次运行追加）
 /data/run_diag.txt
+/data/camera_pref.json
 
 # 可下载的预训练底座权重（放 models/，不进 git，太大）
 /models/

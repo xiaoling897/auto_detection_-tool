@@ -107,11 +107,23 @@ tests/                  # 测试
 - **ultralytics import 慢**（2-5s）：[src/yolo_detector.py](src/yolo_detector.py) 把 `from ultralytics import YOLO` 放在 `__init__` 里延迟 import，避免没用 YOLO 时也付出这个代价。
 - **中文标签画框**：cv2.putText 不支持中文，[src/yolo_detector.py](src/yolo_detector.py) 用 PIL + 微软雅黑（`C:/Windows/Fonts/msyh.ttc`）画中文标签，cv2 只画矩形框——单帧多框时合并一次 cv2↔PIL 转换提速。
 - **中文路径**：Windows + 中文路径下 `cv2.imread` 会**静默失败**，必须用 [src.utils.imread_unicode](src/utils.py)（`np.frombuffer` + `cv2.imdecode`）。当前 GUI 文件框选静态图时用的就是这个。
-- **摄像头打开慢 / 换 4K 摄像头打不开**：[_open_camera](src/gui.py) 用「尝试矩阵」`_CAM_ATTEMPTS` 逐项试——`DSHOW`/`MSMF` 双后端 × `720p`/`native` 双分辨率 × 选配 `MJPG`，第一项就是旧 USB 摄像头惯用的「DSHOW+720p+默认格式」(老设备零回退)，后面几项给 4K UVC 直播摄像机(如海康 DS-UVC-U168R)兜底。
+- **摄像头打开慢 / 换 4K 摄像头打不开**：[_open_camera](src/gui.py) 走「广度优先」两轮探测——先用 `_CAM_FAST`（`DSHOW`/`MSMF` 各一项「720p+默认格式」，老 USB 机零回退）把设备号 0→1→2 快速扫一遍；扫不到再对「确实打得开的设备号」补试 `_CAM_DEEP`（`MJPG` / `native` 分辨率，给 4K UVC 直播摄像机如海康 DS-UVC-U168R 兜底）。
   - **分辨率/格式必须在预热读帧之前设**：旧代码先用默认分辨率预热、之后才设 720p，4K 机就拿 3840×2160 大帧预热导致读帧奇慢——这是换 4K 摄像头后"卡+打不开"的元凶之一。
   - **4K UVC 常需 `MJPG`**：不设压缩格式时有些 4K/USB 机只给原始大帧或不出流；`MSMF` 后端对现代 4K UVC 通常比 `DSHOW` 更稳。
-  - **无摄像头快速回退**：只有 `0 号在所有后端都连打开都失败` 才放弃(不再往后探不存在的设备号，DSHOW 探测不存在号每个卡 7-9s)。实测无摄像头约 0.08s 返回 None。
+  - **别在 0 号就放弃**（2026-09 修，曾导致「插着摄像头却报没摄像头」）：旧逻辑「0 号全后端打不开就停止探测」，理由是「DSHOW 探不存在的设备号每个卡 7-9s」——这个前提在现在的 OpenCV/驱动上已不成立，实测探一个不存在的设备号只要 0~40ms。而 `data/run_diag.txt` 里真实出现过「0 号全后端打不开、真摄像头在 1 号」（USB 摄像头在 Windows 上枚举会飘），旧逻辑那次就直接报了「未找到摄像头」。现在一律扫完 0~2 号，无摄像头仍约 0.1s 返回 None。
+  - **打开只该花 1 秒左右（2026-09 修）**：以前点一下要等 10+ 秒，原因都已治掉——
+    ① **缓存上次成功的配置**（`data/camera_pref.json`，已 gitignore）：命中就一次打开搞定，不再每次重跑整个 6×3 矩阵；配置失效自动退回完整探测。
+    ② **判"有画面"的标准别太急**：旧逻辑「最多读 8 帧 + 每帧 sleep(0.05)」只给了摄像头约 0.4s，自动曝光还没起来就判这套组合失败、关掉再试下一套——一路试到蒙对就是那 10 多秒。现在按时间预算读帧，且 `_try_open` 多返回一个 `streamed`（读到过帧=设备是活的）。
+    ③ **读得到帧但画面暗 → 立刻短路兜底**：暗房/镜头被挡时换 MJPG/MSMF/native 也不会变亮，直接用这套组合打开（`accept_dark=True`），别再白试剩下的组合。
+    ④ 某后端「连打开都失败」→ 同设备该后端的其它格式组合直接跳过（能不能 open 跟 720p/MJPG 无关）。
+    ⑤ **广度优先**：以前「把 0 号 6 种组合试穿再看 1 号」，0 号被别的程序占着时要白等 7 秒才轮到真摄像头；现在 2.5s 内就能找到 1 号上的摄像头。
+    ⑥ 总预算 `CAMERA_PROBE_BUDGET=10s` 兜底，最坏情况（几个设备号都能打开却都不出流）也不会无限拖。
+    实测（用假摄像头模拟 9 种故障模式，开发机没真摄像头）：正常 0.02s / 慢启动 1.2s / 暗房 1.2s / 摄像头在 1 号 0.02s / 0 号被占用且真机在 1 号 2.5s / 只吃 MJPG 的 4K 机 1.3s / 缓存命中 0.01s。
   - **硬件侧排查**(程序无能为力的情况)：直播摄像机要 USB-C 数据线接电脑(很多 C 口线只充电不传数据)、ON/OFF 拨 ON、4K@8.6W 常需插 DC 12V。先用 [scripts/probe_camera.py](scripts/probe_camera.py) 枚举 0~3 号确认 Windows 是否认到——全"打不开"就是接线/供电/驱动问题，跟程序无关。
+- **打开摄像头闪屏（2026-09 修）**：三处一起改才不闪——
+  - **黑帧 ≠ 断流**：摄像头刚开流时自动曝光没起来，头几十帧是黑的。旧代码用 `BAD_FRAME_LIMIT=3` 一视同仁，3 帧就切成橙色「Camera signal lost」占位图、下一帧又切回 → 闪。现在黑帧走独立的 `BLANK_FRAME_LIMIT=25`，且开流后 `CAMERA_WARMUP_GRACE=3.0s` 内一律不判信号丢失，宽限期里黑就黑地照常显示，保持画面连续。
+  - **别每帧重建 PhotoImage**：旧 `_show_frame` 每帧 `ImageTk.PhotoImage(...)` + `configure(image=...)`，Tk 每次都擦背景+重算布局，几十 Hz 下肉眼可见地闪。现在每帧 `_letterbox` 到固定 `DISPLAY_W×DISPLAY_H`（900×506），PhotoImage 只建一次、之后 `paste()` 原地换像素——控件完全不动。实测 62→91 fps。切回文字占位符的地方必须把 `self._imgtk = None`，否则下轮 paste 到已解绑的图片上不显示。
+  - **布局不许被内容撑动**：`video_card.pack_propagate(False)` + 固定尺寸，避免「文字占位符(小) → 第一帧画面(大)」把左栏撑开、右侧清单被挤着抖一下。状态栏统一走 `_set_stats`（文字没变就不 config），省掉 UI 泵每 15ms 一次的无谓重绘。
 - **`smart_tools.json` 的 `features` 字段是历史遗留**（旧 ORB descriptors，4.8MB）。YOLO 模式只读 `name` 字段（[load_tool_names](src/loader.py)）。保留 features 是为旧脚本兼容。
 - **只有显示线程碰 Tkinter**：`_camera_loop` / `_static_once`（显示线程）直接调 `.config()` / `pack()` / `_show_frame()`，Tkinter 严格上非线程安全但实际稳定能用。**推理线程 `_inference_worker` 绝不能碰任何 Tkinter 控件**，只写普通 dict/list（`_last_boxes` 等）——这是双线程能安全跑的前提。要再加重负载（如额外后处理）也放推理线程，别塞进显示线程，否则视频会卡。
 
@@ -121,6 +133,9 @@ tests/                  # 测试
 # 验证算法（批量测试）
 python tests/test_image_detect.py                       # 跑 data/samples 全部
 python tests/test_image_detect.py data/samples/all_tools.jpg
+
+# 验证摄像头探测/闪屏逻辑（用假摄像头模拟故障，**不需要真摄像头**；改 _open_camera 后必跑）
+python tests/verify_camera_open.py
 
 # 重建 smart_tools.json（加新模板后）
 python scripts/extract_features.py
